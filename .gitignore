@@ -1,0 +1,17 @@
+# Müşteri ve banka verisi: asla depoya girmez
+portfolio_config.py
+*.parquet
+*.xlsx
+*.xls
+*.jsonl
+*.csv
+dashboard*.html
+llm_cache*
+kontrol_etiketleri*
+# Şifre ya da anahtar içeren yerel kopyalar
+*_local.py
+.env
+# Python
+__pycache__/
+*.pyc
+.venv/
