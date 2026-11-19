@@ -131,8 +131,8 @@ def _check_temp8_freshness(connection, df: pd.DataFrame) -> None:
                     "DİKKAT: %s.TEMP8 tablosu %d gün önce oluşturulmuş! SQL Developer'da sorgu.txt çalıştırılmamış olabilir.",
                     ORACLE_SCHEMA, age_days,
                 )
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("Oracle %s.TEMP8 güncellik kontrolü yapılamadı: %s", ORACLE_SCHEMA, exc)
     cols = {c.lower(): c for c in df.columns}
     if "part_id" in cols and not df.empty:
         max_part = df[cols["part_id"]].dropna().max()

@@ -106,6 +106,7 @@ def fetch_ilan_gov_tr(session: requests.Session, existing_urls: Set[str], days: 
         try:
             res = session.post(ILAN_GOV_SEARCH_API, json=payload, timeout=20)
             if res.status_code != 200:
+                logger.warning("İlan.gov.tr '%s' sorgusu HTTP %d döndü (uç nokta/erişim kontrol edilmeli).", term, res.status_code)
                 continue
             data = res.json()
             items = ((data.get("result") or {}).get("items")) or data.get("items") or []

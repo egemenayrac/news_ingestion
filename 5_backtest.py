@@ -21,7 +21,9 @@ dwh_agent Entegrasyonu:
 from __future__ import annotations
 
 import importlib
+import json
 import logging
+import re
 import sqlite3
 import sys
 from pathlib import Path
@@ -32,6 +34,7 @@ import pandas as pd
 ROOT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT_DIR))
 
+import ayarlar  # noqa: E402
 from ews import defter as ews_defter  # noqa: E402
 from ews import eslestirme  # noqa: E402
 from ews import olay as ews_olay  # noqa: E402
@@ -44,7 +47,7 @@ logger = logging.getLogger("ews_backtest")
 # =============================================================================
 # 1. Ayarlar
 # =============================================================================
-CACHE_PATH = ROOT_DIR / "llm_cache.jsonl"
+CACHE_PATH = ayarlar.CACHE_PATH
 OUTCOMES_PATH = ROOT_DIR / "gerceklesen_olaylar.csv"   # veya .parquet (kolonlar: counterparty_id, outcome_dt, outcome_type)
 BACKTEST_EXCEL_PATH = ROOT_DIR / "backtest_raporu.xlsx"
 LEAD_WINDOW_DAYS = 180                                 # olaydan önceki kaç gün içinde verilen alarm "erken uyarı" sayılır
@@ -74,6 +77,15 @@ ORDER BY c.owner, c.table_name
 # =============================================================================
 # 2. dwh_agent Bilgi Tabanından (kb.sqlite) Sonuç Tablosu Keşfi
 # =============================================================================
+def _card_summary(card_json: object) -> str:
+    if not card_json:
+        return ""
+    try:
+        return str(json.loads(str(card_json)).get("ozet") or "")
+    except (ValueError, TypeError, AttributeError):
+        return str(card_json)[:200]
+
+
 def find_candidate_outcome_tables(kb_path: Optional[Path] = None) -> pd.DataFrame:
     """dwh_agent'ın kb.sqlite veritabanında Stage geçişi, Yakın İzleme, Yapılandırma ve NPL tablolarını arar."""
     target = Path(kb_path) if kb_path else next((p for p in DWH_AGENT_KB_CANDIDATES if p.exists()), None)
@@ -81,22 +93,34 @@ def find_candidate_outcome_tables(kb_path: Optional[Path] = None) -> pd.DataFram
         logger.info("dwh_agent kb.sqlite bulunamadı. Oracle'da sonuç tablosu aramak için ORACLE_OUTCOME_DISCOVERY_SQL sorgusunu kullanın.")
         return pd.DataFrame()
 
-    query = """
-    SELECT t.owner, t.table_name, t.num_rows,
-            COALESCE(tc.summary, '') AS tablo_karti_ozeti,
-            GROUP_CONCAT(c.column_name, ', ') AS ilgili_kolonlar
-    FROM tables t
-    JOIN columns c ON c.owner = t.owner AND c.table_name = t.table_name
-    LEFT JOIN table_cards tc ON tc.owner = t.owner AND tc.table_name = t.table_name
-    WHERE c.column_name REGEXP '(?i)(STAGE|DPD|GECIK|WATCH|IZLEME|YAPILAND|RESTRUCT|TAKIP|NPL|DEFAULT|CLASSIFYING_NOTE)'
-    GROUP BY t.owner, t.table_name
-    ORDER BY COALESCE(t.num_rows, 0) DESC
-    LIMIT 50
-    """
     try:
         with sqlite3.connect(str(target)) as conn:
-            conn.create_function("REGEXP", 2, lambda pat, val: bool(val and pd.Series([str(val)]).str.contains(pat, regex=True).iloc[0]))
+            conn.create_function(
+                "REGEXP", 2, lambda pat, val: bool(val is not None and re.search(pat, str(val)))
+            )
+            has_cards = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='table_cards'"
+            ).fetchone() is not None
+            card_select = "COALESCE(tc.card, '') AS tablo_karti_ozeti" if has_cards else "'' AS tablo_karti_ozeti"
+            card_join = (
+                "LEFT JOIN table_cards tc ON tc.owner = o.owner AND tc.table_name = o.name AND tc.status = 'ok'"
+                if has_cards else ""
+            )
+            query = f"""
+            SELECT o.owner, o.name AS table_name, o.num_rows,
+                   {card_select},
+                   GROUP_CONCAT(c.column_name, ', ') AS ilgili_kolonlar
+            FROM objects o
+            JOIN columns c ON c.owner = o.owner AND c.table_name = o.name
+            {card_join}
+            WHERE c.column_name REGEXP '(?i)(STAGE|DPD|GECIK|WATCH|IZLEME|YAPILAND|RESTRUCT|TAKIP|NPL|DEFAULT|CLASSIFYING_NOTE)'
+            GROUP BY o.owner, o.name
+            ORDER BY COALESCE(o.num_rows, 0) DESC
+            LIMIT 50
+            """
             df = pd.read_sql_query(query, conn)
+            if "tablo_karti_ozeti" in df.columns:
+                df["tablo_karti_ozeti"] = df["tablo_karti_ozeti"].map(_card_summary)
             logger.info("dwh_agent kb.sqlite üzerinden %d aday sonuç tablosu bulundu.", len(df))
             return df
     except Exception as exc:
@@ -108,13 +132,20 @@ def find_candidate_outcome_tables(kb_path: Optional[Path] = None) -> pd.DataFram
 # 3. Belirli Bir Tarih (as_of) İçin Zaman Makinesi Koşusu
 # =============================================================================
 def run_snapshot_as_of(as_of_date: str, llm: LLMClient, cache: Cache, fin_df: pd.DataFrame,
-                       zayif_dscr: float = 1.2, workers: int = 2) -> pd.DataFrame:
+                       zayif_dscr: float = 1.2, workers: int = 2,
+                       prematched_df: Optional[pd.DataFrame] = None) -> pd.DataFrame:
     """Sistemi sanki `as_of_date` günündeymişiz gibi yalnızca o tarihe kadarki haberlerle çalıştırır."""
-    df = eslestirme.run_matching(as_of=as_of_date)
+    if prematched_df is not None:
+        start, end = eslestirme.news_window(eslestirme.AGGREGATION_WINDOW_DAYS, as_of=as_of_date)
+        dt_series = eslestirme.to_naive_datetime(prematched_df["Tarih"])
+        df = prematched_df[(dt_series >= start) & (dt_series <= end)].copy()
+    else:
+        df = eslestirme.run_matching(as_of=as_of_date)
     if df.empty:
         return pd.DataFrame()
     df = df.reset_index(drop=True)
-    df["_Anahtar"] = ews_olay.pair_keys(df)
+    if "_Anahtar" not in df.columns:
+        df["_Anahtar"] = ews_olay.pair_keys(df)
 
     # Önbellekte olmayan eşleşmeler varsa ve LLM ayarlıysa sor
     todo = [r for r in df.to_dict("records") if r["_Anahtar"] not in cache]
@@ -196,6 +227,7 @@ def evaluate_backtest(snapshots: pd.DataFrame, outcomes: pd.DataFrame,
         comb_hits = prior[prior["Birlesik_Stage"] >= 2]
 
         first_haber_dt = haber_hits["As_Of_DT"].iloc[0] if len(haber_hits) else pd.NaT
+        first_fin_dt = fin_hits["As_Of_DT"].iloc[0] if len(fin_hits) else pd.NaT
         first_comb_dt = comb_hits["As_Of_DT"].iloc[0] if len(comb_hits) else pd.NaT
 
         event_rows.append({
@@ -208,6 +240,7 @@ def evaluate_backtest(snapshots: pd.DataFrame, outcomes: pd.DataFrame,
             "Birlesik_Yakaladi": bool(len(comb_hits)),
             "Ilk_Haber_Alarm_Tarihi": first_haber_dt.strftime("%Y-%m-%d") if pd.notna(first_haber_dt) else None,
             "Haber_Kursun_Suresi_Gun": int((ev_dt - first_haber_dt).days) if pd.notna(first_haber_dt) else None,
+            "Finansal_Kursun_Suresi_Gun": int((ev_dt - first_fin_dt).days) if pd.notna(first_fin_dt) else None,
             "Birlesik_Kursun_Suresi_Gun": int((ev_dt - first_comb_dt).days) if pd.notna(first_comb_dt) else None,
             "Alarm_Kaniti": haber_hits["En_Agir_Olay"].iloc[0] if len(haber_hits) else None,
         })
@@ -234,7 +267,7 @@ def evaluate_backtest(snapshots: pd.DataFrame, outcomes: pd.DataFrame,
             "Toplam_Kredi_Olayi": n_events,
             "Yakalanan_Olay": int(ev_table["Finansal_Yakaladi"].sum()) if n_events else 0,
             "Yakalama_Orani_Yuzde": round(100 * ev_table["Finansal_Yakaladi"].mean(), 1) if n_events else 0.0,
-            "Medyan_Kursun_Suresi_Gun": None,
+            "Medyan_Kursun_Suresi_Gun": float(ev_table["Finansal_Kursun_Suresi_Gun"].median()) if n_events and ev_table["Finansal_Kursun_Suresi_Gun"].notna().any() else None,
             "Yanlis_Alarm_100_Sirket_Ay": round(100 * (clean_snaps["Fin_Stage"] >= 2).sum() / n_clean, 1),
         },
         {
@@ -249,10 +282,20 @@ def evaluate_backtest(snapshots: pd.DataFrame, outcomes: pd.DataFrame,
     return {"Ozet_Metrikler": metrics, "Olay_Bazli_Analiz": ev_table, "Tum_Donemler": snap.drop(columns=["As_Of_DT"])}
 
 
+def _month_ends(start_dt: pd.Timestamp, end_dt: pd.Timestamp) -> pd.DatetimeIndex:
+    """pandas 2.2+ ('ME') ve eski pandas ('M') sürümleriyle uyumlu ay sonu tarih aralığı."""
+    try:
+        return pd.date_range(start_dt, end_dt, freq="ME")
+    except ValueError:
+        return pd.date_range(start_dt, end_dt, freq="M")
+
+
 def run_backtest(as_of_dates: Optional[List[str]] = None) -> Dict[str, pd.DataFrame]:
     """Haber arşivindeki ayların son günleri için geriye dönük testi çalıştırır ve Excel raporu üretir."""
     cfg = importlib.import_module("3_llm_dogrulama")
-    llm = LLMClient(url=cfg.LLM["url"], key=cfg.LLM["key"], model=cfg.LLM["model"],
+    url = ayarlar.get_llm_url(interactive=False) if "<SUNUCU>" in cfg.LLM["url"] else cfg.LLM["url"]
+    key = cfg.LLM["key"] or ayarlar.get_llm_api_key(interactive=False)
+    llm = LLMClient(url=url, key=key, model=cfg.LLM["model"],
                     verify=resolve_ssl_verify(cfg.LLM_VERIFY_SSL), timeout=cfg.LLM_TIMEOUT,
                     retries=cfg.LLM_RETRIES, max_tokens=cfg.LLM_MAX_TOKENS)
     cache = Cache(CACHE_PATH)
@@ -267,13 +310,25 @@ def run_backtest(as_of_dates: Optional[List[str]] = None) -> Dict[str, pd.DataFr
         if dates.empty:
             return {}
         # Arşivdeki her ayın son günü + en son haber günü
-        month_ends = pd.date_range(dates.min().normalize(), dates.max().normalize(), freq="ME")
+        month_ends = _month_ends(dates.min().normalize(), dates.max().normalize())
         as_of_dates = sorted({d.strftime("%Y-%m-%d") for d in month_ends} | {dates.max().strftime("%Y-%m-%d")})
+
+    # Tüm dönemler için eşleştirmeyi bir kez yapıp bellekte dilimle (disk/regex tekrarını önler)
+    prematched = None
+    if as_of_dates:
+        ts_dates = [pd.Timestamp(d) for d in as_of_dates]
+        span_days = max(0, (max(ts_dates) - min(ts_dates)).days) + eslestirme.AGGREGATION_WINDOW_DAYS + 1
+        prematched = eslestirme.run_matching(as_of=max(ts_dates), window_days=span_days)
+        if not prematched.empty:
+            prematched = prematched.reset_index(drop=True)
+            prematched["_Anahtar"] = ews_olay.pair_keys(prematched)
 
     logger.info("Geriye dönük test %d dönem için çalıştırılıyor: %s", len(as_of_dates), ", ".join(as_of_dates))
     snaps = []
     for dt_str in as_of_dates:
-        comb = run_snapshot_as_of(dt_str, llm, cache, fin_df, zayif_dscr=cfg.ZAYIF_DSCR, workers=cfg.LLM_WORKERS)
+        comb = run_snapshot_as_of(
+            dt_str, llm, cache, fin_df, zayif_dscr=cfg.ZAYIF_DSCR, workers=cfg.LLM_WORKERS, prematched_df=prematched
+        )
         if not comb.empty:
             snaps.append(comb)
 

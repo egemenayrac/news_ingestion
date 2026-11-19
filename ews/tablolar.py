@@ -226,8 +226,10 @@ def write_excel(sheets: Dict[str, pd.DataFrame], path: Path) -> Path:
         try:
             with pd.ExcelWriter(target) as writer:
                 for name, table in sheets.items():
-                    table = table[[c for c in table.columns if not str(c).startswith("_")]]  # iç kolonlar yazılmaz
-                    table.replace(_ILLEGAL_RE, "", regex=True).to_excel(writer, sheet_name=name, index=False)
+                    table = table[[c for c in table.columns if not str(c).startswith("_")]].copy()  # iç kolonlar yazılmaz
+                    for col in table.select_dtypes(include=["object", "string"]).columns:
+                        table[col] = table[col].replace(_ILLEGAL_RE, "", regex=True)
+                    table.to_excel(writer, sheet_name=name, index=False)
             return target
         except PermissionError:
             logger.warning("%s yazılamadı (Excel'de açık olabilir); yeni adla deneniyor.", target)

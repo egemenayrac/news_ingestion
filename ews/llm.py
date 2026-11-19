@@ -14,7 +14,7 @@ import ssl
 import tempfile
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
@@ -51,6 +51,7 @@ class LLMClient:
     timeout: int = 300
     retries: int = 3
     max_tokens: int = 1024
+    _session: requests.Session = field(default_factory=requests.Session, init=False, repr=False)
 
     def ask(self, system: str, user: str, max_tokens: int = 0) -> Tuple[Optional[dict], str]:
         """Tek soru sorar; (JSON sözlük ya da None, durum) döndürür.
@@ -69,7 +70,7 @@ class LLMClient:
         for attempt in range(1, self.retries + 1):
             wait = 5 * attempt
             try:
-                r = requests.post(self.url, json=payload, headers=headers, timeout=self.timeout, verify=self.verify)
+                r = self._session.post(self.url, json=payload, headers=headers, timeout=self.timeout, verify=self.verify)
                 if r.status_code in (429, 500, 502, 503, 504):
                     last = f"HTTP {r.status_code}: {r.text[:150]}{_correlation(r)}"
                     if r.status_code == 429:  # "çok fazla istek": sunucunun söylediği kadar, yoksa 30/60 sn
@@ -103,7 +104,7 @@ class LLMClient:
             "moderations_disabled": False,
         }
         try:
-            r = requests.post(mod_url, json=payload, headers=headers, timeout=min(self.timeout, 30), verify=self.verify)
+            r = self._session.post(mod_url, json=payload, headers=headers, timeout=min(self.timeout, 30), verify=self.verify)
             if r.ok:
                 results = r.json().get("results") or []
                 if results and isinstance(results[0].get("category_scores"), dict):

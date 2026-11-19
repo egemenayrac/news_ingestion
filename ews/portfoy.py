@@ -25,7 +25,11 @@ logger = logging.getLogger("ews_llm")
 # =============================================================================
 # Birlesik: haber sinyali + finansal skor + bakiye
 # =============================================================================
-STRUCTURED_PARQUET_PATH = Path(__file__).resolve().parent.parent / "structured_data.parquet"
+try:
+    import ayarlar as _ayarlar
+    STRUCTURED_PARQUET_PATH = _ayarlar.STRUCTURED_PARQUET_PATH
+except ImportError:
+    STRUCTURED_PARQUET_PATH = Path(__file__).resolve().parent.parent / "structured_data.parquet"
 REQUIRED_FINANCIAL_API = 5   # beklenen ews/financial.py sürümü (üç katmanlı model)
 KAPSAM_UYARI_ESIK = 0.5      # finansal veri kapsamı bunun altındaysa skor bir alt sınırdır; Not'ta işaretlenir
 if FINANCIAL_API_VERSION < REQUIRED_FINANCIAL_API:
@@ -157,7 +161,7 @@ Ortak gelişme şunlardan biri olabilir:
   3. Aynı ticari ağdaki zincirleme kriz, grev/sendika uyuşmazlığı veya ortak finansal darboğaz
 
 Kurallar:
-- Önceden tanımlı bir şablona bağlı kalma; yalnızca yukarıdaki satırlarda gördüğün somut ortak gelişmeleri çıkar.
+- Önceden tanımlı bir şablona bağlı kalma; yalnızca yukarıdaki satırlarda açıkça geçen somut ortak gelişmeleri çıkar, satırlarda olmayanı ekleme ve kendi bilgini koyma.
 - Farklı haberler aynı konuyu farklı kelimelerle anlatabilir (ör. biri "soruşturma", diğeri "inceleme" veya "ceza"; biri "kur baskısı", diğeri "döviz artışı"). Bu yüzden her tema için maddelerde geçen anahtar kavramları "kanit_kelimeler" listesine (2-5 kelime/ifade) yaz.
 - Bir tema en az 2 FARKLI şirketi kapsamalı; her madde en uygun tek bir temaya girmeli.
 
@@ -240,7 +244,7 @@ def build_themes(df: pd.DataFrame, companies: pd.DataFrame, fin: pd.DataFrame, l
         if isinstance(kanit_list, str):
             kanit_list = [x.strip() for x in re.split(r"[,;|]+", kanit_list) if x.strip()]
         ortak_ifade_str = ", ".join(str(x) for x in kanit_list) if isinstance(kanit_list, list) else str(kanit_list)
-        stems = _extract_stems([tema_adi, aciklama] + (kanit_list if isinstance(kanit_list, list) else [kanit_list]))
+        stems = _extract_stems(kanit_list if isinstance(kanit_list, list) else [kanit_list])
 
         raw_nos = [int(i) for i in (t.get("maddeler") or [])
                    if str(i).strip().isdigit() and int(i) < len(items) and int(i) not in used]
@@ -251,8 +255,16 @@ def build_themes(df: pd.DataFrame, companies: pd.DataFrame, fin: pd.DataFrame, l
             if _mentions_any(stems, fold(item_text)):
                 verified_nos.append(i)
             elif hasattr(llm, "similarity"):
-                scores = llm.similarity(item_text, [cat_desc], threshold=TEMA_EMBED_ESIK)
-                if scores and scores.get(cat_desc, 0.0) >= TEMA_EMBED_ESIK:
+                sim_key = f"SIM|{hashlib.md5((item_text[:500] + '|' + cat_desc[:300]).encode('utf-8')).hexdigest()[:16]}"
+                cached_sim = cache.get(sim_key) if cache is not None else None
+                if isinstance(cached_sim, dict) and "score" in cached_sim:
+                    score = float(cached_sim["score"])
+                else:
+                    scores = llm.similarity(item_text, [cat_desc], threshold=TEMA_EMBED_ESIK)
+                    score = float(scores.get(cat_desc, 0.0)) if scores else -1.0
+                    if scores is not None and cache is not None:
+                        cache.put(sim_key, {"score": score})
+                if score >= TEMA_EMBED_ESIK:
                     verified_nos.append(i)
 
         members = items.loc[verified_nos]
@@ -260,13 +272,15 @@ def build_themes(df: pd.DataFrame, companies: pd.DataFrame, fin: pd.DataFrame, l
             continue
         used.update(verified_nos)
         sirketler = members.drop_duplicates("Şirket")
+        max_stage = sinyal.reindex(sirketler["Şirket"]).max()
+        stage_no = int(max_stage) if pd.notna(max_stage) else 1
         rows.append({
             "Tema": tema_adi[:120],
             "Aciklama": aciklama[:300],
             "Ortak_Ifade": ortak_ifade_str[:120],
             "Sirket_Sayisi": len(sirketler),
             "Toplam_Bakiye_TRY": bakiye.reindex(sirketler["Şirket"]).sum(min_count=1),
-            "En_Yuksek_Haber_Sinyali": STAGE_LABEL[int(sinyal.reindex(sirketler["Şirket"]).max())],
+            "En_Yuksek_Haber_Sinyali": STAGE_LABEL[stage_no],
             "Sirketler": "; ".join(sirketler["Şirket_Adi"]),
             "Olay_Tipleri": ", ".join(f"{k} ({v})" for k, v in members["LLM_Olay"].value_counts().items()),
             "Kanit": " | ".join(f"{m['Şirket_Adi']}: {m['Başlık']} ({m['Tarih']})" for _, m in members.iterrows()),

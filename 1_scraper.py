@@ -108,9 +108,13 @@ def get_soup_with_retry(url: str, retries: int = 3) -> BeautifulSoup:
     session = get_session()
     for _ in range(retries):
         try:
-            res = session.get(url, timeout=(5, 15)) 
-            if res.status_code == 200: return BeautifulSoup(res.content, 'html.parser')
-        except: time.sleep(1) 
+            res = session.get(url, timeout=(5, 15))
+            if res.status_code == 200:
+                return BeautifulSoup(res.content, 'html.parser')
+            if res.status_code in (404, 410):
+                return None
+        except Exception:
+            time.sleep(1)
     return None
 
 def get_content_with_retry(url: str, retries: int = 3) -> str:
@@ -120,10 +124,13 @@ def get_content_with_retry(url: str, retries: int = 3) -> str:
             res = session.get(url, timeout=(5, 20))
             if res.status_code == 200:
                 content = res.content
-                if content.startswith(b'\x1f\x8b'):  
+                if content.startswith(b'\x1f\x8b'):
                     content = gzip.GzipFile(fileobj=io.BytesIO(content)).read()
                 return content.decode('utf-8', errors='ignore')
-        except: time.sleep(1)
+            if res.status_code in (404, 410):
+                return ""
+        except Exception:
+            time.sleep(1)
     return ""
 
 def determine_source(url: str) -> str:

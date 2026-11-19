@@ -113,11 +113,11 @@ def run(limit: int = LIMIT) -> Tuple[pd.DataFrame, pd.DataFrame]:
 
     url = LLM["url"]
     key = LLM["key"]
-    if todo:
-        url = ayarlar.get_llm_url(interactive=True) if "<SUNUCU>" in url else url
-        key = key or ayarlar.get_llm_api_key(interactive=True)
-        if "<SUNUCU>" in url:
-            raise SystemExit("ayarlar.py: LLM_URL ayarını doldurun.")
+    if "<SUNUCU>" in url:
+        url = ayarlar.get_llm_url(interactive=bool(todo))
+    key = key or ayarlar.get_llm_api_key(interactive=bool(todo))
+    if todo and "<SUNUCU>" in url:
+        raise SystemExit("ayarlar.py: LLM_URL ayarını doldurun.")
 
     llm = LLMClient(url=url, key=key, model=LLM["model"], verify=resolve_ssl_verify(LLM_VERIFY_SSL),
                     timeout=LLM_TIMEOUT, retries=LLM_RETRIES, max_tokens=LLM_MAX_TOKENS)
