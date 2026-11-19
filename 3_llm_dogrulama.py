@@ -1,28 +1,19 @@
-"""Kurumsal Kredi Riski Erken Uyarı Sistemi (EWS) - LLM doğrulama katmanı.
+"""Kurumsal Kredi Riski Erken Uyarı Sistemi (EWS) - LLM doğrulama ve skorlama orkestratörü (3_llm_dogrulama.py).
 
-3_eslestirme.py haberleri alias'larla şirketlere bilerek geniş eşleştirir: bir haberin kaçmaması için yanlış
+ews.eslestirme haberleri alias'larla şirketlere bilerek geniş eşleştirir: bir haberin kaçmaması için yanlış
 eşleşmeye ("ANKARA 2" -> "Ankara 2. Asliye Ceza Mahkemesi") razı olunur. Bu betik her (haber, şirket)
 eşleşmesini bankanın LLM'ine sorar (alaka ve olay), alıntıyı haberde arar, şirket başına olay defteri tutar
 (haber sinyali), finansal skoru hesaplar ve ikisini bakiyeyle birleştirir. Puan yerine kanıtlı olay üretilir:
 hedef değişken olmadan puan kalibre edilemez, alıntılı olay ise kontrol edilebilir.
 
-Dosyalar (hepsi aynı klasörde):
-  3_eslestirme.py     haber ve şirket eşleştirme (bu betik çağırır, ayrıca çalıştırmaya gerek yok)
-  4_llm_dogrulama.py  ayarlar ve akış (bu dosya)
-  ews_llm.py          LLM istemcisi ve önbellek
-  ews_olay.py         olay sözlüğü, alaka/olay soruları, alıntı kontrolü
-  ews_defter.py       şirket başına olay defteri (açılan / kapanan olaylar)
-  ews_tablolar.py     Şirketler, Olay_Defteri, Kayıtlar, Kontrol, Alias sayfaları
-  ews_portfoy.py      finansal skor (ews_financial), Birlesik (haber + finansal + bakiye) ve Temalar sayfaları
-  ews_dashboard.py    dashboard.html (tarayıcıda açılan panel) ve günlük sinyal geçmişi
-
-Girdi:  haber parquet'i (yolu 3_eslestirme.py'de) ve portfolio_config.py, LLM; varsa structured_data.parquet
-        (2_sql_to_parquet çıktısı; finansal skor ve bakiye).
-Çıktı:  llm_dogrulama.xlsx (Birlesik, Şirketler, Olay_Defteri, Temalar, Kayıtlar, Kontrol, Kontrol_Etiketleri, Alias,
-        Alias_Onerisi), llm_cache.jsonl (LLM cevapları: aynı soru bir daha sorulmaz, yarıda kalan koşu devam eder),
-        kontrol_etiketleri.jsonl (Kontrol sayfasına yazılan analist notları; her koşuda Excel'den toplanır),
-        dashboard.html ve dashboard_gecmis.jsonl (günlük sinyal geçmişi; "Ne değişti" sayfası bunu kullanır).
-Çalıştırma: LLM ayarını doldurun ve bu dosyayı çalıştırın.
+Modüller (ews/ paketi altında):
+  ews/eslestirme.py   haber ve şirket eşleştirme (bu betik çağırır, ayrıca çalıştırmaya gerek yok)
+  ews/llm.py          LLM istemcisi, /v1/moderations benzerlik servisi ve önbellek
+  ews/olay.py         olay sözlüğü, alaka/olay soruları, alıntı kontrolü
+  ews/defter.py       şirket başına olay defteri (açılan / kapanan olaylar)
+  ews/tablolar.py     Şirketler, Olay_Defteri, Kayıtlar, Kontrol, Alias sayfaları
+  ews/portfoy.py      finansal skor (ews.financial), Birlesik (haber + finansal + bakiye + 2B matris) ve Temalar sayfaları
+  ews/dashboard.py    dashboard.html (tarayıcıda açılan panel) ve günlük sinyal geçmişi
 """
 
 from __future__ import annotations
@@ -39,46 +30,42 @@ import pandas as pd
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
-import ews_dashboard  # noqa: E402  (modüller SCRIPT_DIR'den yüklenir)
-import ews_defter  # noqa: E402
-import ews_olay  # noqa: E402
-import ews_portfoy  # noqa: E402
-import ews_tablolar  # noqa: E402
-from ews_llm import Cache, LLMClient, resolve_ssl_verify  # noqa: E402
+import ayarlar
+from ews import dashboard as ews_dashboard  # noqa: E402
+from ews import defter as ews_defter  # noqa: E402
+from ews import olay as ews_olay  # noqa: E402
+from ews import portfoy as ews_portfoy  # noqa: E402
+from ews import tablolar as ews_tablolar  # noqa: E402
+from ews.llm import Cache, LLMClient, resolve_ssl_verify  # noqa: E402
 
 logger = logging.getLogger("ews_llm")
 
 
 # =============================================================================
-# Ayarlar
+# Ayarlar (ayarlar.py üzerinden okunur)
 # =============================================================================
-# OpenAI uyumlu endpoint: tam adres (/v1/chat/completions dahil) ve API anahtarı. Kurumsal endpoint
-# "model" alanını reddettiği için model boş bırakılır (boşsa gönderilmez).
-LLM = {"url": "https://<SUNUCU>/v1/chat/completions", "key": "", "model": ""}
-# "windows": bankanın kök sertifikası Windows sertifika deposundan alınır (önerilen).
-# Diğerleri: True, False (doğrulama kapalı, yalnızca deneme) ya da r"C:\...\banka_ca.pem".
-LLM_VERIFY_SSL = "windows"
-LLM_TIMEOUT = 300            # saniye
-LLM_WORKERS = 2              # paralel istek; HTTP 429 alınırsa 1
-LLM_RETRIES = 3
-LLM_MAX_TOKENS = 1024
-LIMIT = 0                    # 0 = hepsi; denemede ör. 20 (en yeni haberler önce sorulur)
-ALIAS_MIN_ESLESME = 3        # bu kadar eşleşmenin hiçbiri kabul edilmeyen alias için "remove" önerilir
-ZAYIF_DSCR = 1.2             # Birlesik: altındaki DSCR "zayıf finansal" (kâr düşüşü Stage 2'ye çıkar)
+LLM = {"url": ayarlar.LLM_URL, "key": ayarlar.LLM_API_KEY, "model": ayarlar.LLM_MODEL}
+LLM_VERIFY_SSL = ayarlar.LLM_VERIFY_SSL
+LLM_TIMEOUT = ayarlar.LLM_TIMEOUT
+LLM_WORKERS = ayarlar.LLM_WORKERS
+LLM_RETRIES = ayarlar.LLM_RETRIES
+LLM_MAX_TOKENS = ayarlar.LLM_MAX_TOKENS
+LIMIT = ayarlar.LLM_LIMIT
+ALIAS_MIN_ESLESME = ayarlar.ALIAS_MIN_ESLESME
+ZAYIF_DSCR = ayarlar.ZAYIF_DSCR
 
-CACHE_PATH = SCRIPT_DIR / "llm_cache.jsonl"
-CIKTI_PATH = SCRIPT_DIR / "llm_dogrulama.xlsx"
-DASHBOARD_PATH = SCRIPT_DIR / "dashboard.html"
-GECMIS_PATH = SCRIPT_DIR / "dashboard_gecmis.jsonl"  # silinirse "Ne değişti" ve trend sıfırdan başlar
-KONTROL_PATH = SCRIPT_DIR / "kontrol_etiketleri.jsonl"  # Kontrol sayfasındaki analist notları; silinirse kaybolur
-# Prompt sürümleri modüllerdedir: ews_olay.PROMPT_SURUMU, ews_defter.DEFTER_SURUMU, ews_portfoy.TEMA_SURUMU.
+CACHE_PATH = ayarlar.CACHE_PATH
+CIKTI_PATH = ayarlar.EXCEL_OUTPUT_PATH
+DASHBOARD_PATH = ayarlar.DASHBOARD_OUTPUT_PATH
+GECMIS_PATH = ayarlar.GECMIS_PATH
+KONTROL_PATH = ayarlar.KONTROL_PATH
 
 
 # =============================================================================
 # Adımlar
 # =============================================================================
 def load_matches() -> pd.DataFrame:
-    """3_eslestirme ile haberleri şirketlerle eşleştirir; her kayda önbellek anahtarı ekler."""
+    """ews.eslestirme ile haberleri şirketlerle eşleştirir; her kayda önbellek anahtarı ekler."""
     df = ews_olay.eslestirme.run_matching()
     if df.empty:
         return pd.DataFrame()
@@ -114,8 +101,6 @@ def ask_matches(todo: List[dict], llm: LLMClient, cache: Cache) -> Dict[str, str
 def run(limit: int = LIMIT) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """Eşleştirir, yeni eşleşmeleri LLM'e sorar, defteri kurar, Excel'i yazar; (kayıtlar, şirketler) döndürür."""
     started = time.time()
-    llm = LLMClient(url=LLM["url"], key=LLM["key"], model=LLM["model"], verify=resolve_ssl_verify(LLM_VERIFY_SSL),
-                    timeout=LLM_TIMEOUT, retries=LLM_RETRIES, max_tokens=LLM_MAX_TOKENS)
     df = load_matches()
     if df.empty:
         logger.warning("Eşleşen kayıt yok.")
@@ -125,8 +110,17 @@ def run(limit: int = LIMIT) -> Tuple[pd.DataFrame, pd.DataFrame]:
     cache = Cache(CACHE_PATH)
     todo = [r for r in df.to_dict("records") if r["_Anahtar"] not in cache]
     todo = todo[:limit] if limit else todo
-    if todo and "<SUNUCU>" in llm.url:
-        raise SystemExit("4_llm_dogrulama.py: LLM ayarını (url, key) doldurun.")
+
+    url = LLM["url"]
+    key = LLM["key"]
+    if todo:
+        url = ayarlar.get_llm_url(interactive=True) if "<SUNUCU>" in url else url
+        key = key or ayarlar.get_llm_api_key(interactive=True)
+        if "<SUNUCU>" in url:
+            raise SystemExit("ayarlar.py: LLM_URL ayarını doldurun.")
+
+    llm = LLMClient(url=url, key=key, model=LLM["model"], verify=resolve_ssl_verify(LLM_VERIFY_SSL),
+                    timeout=LLM_TIMEOUT, retries=LLM_RETRIES, max_tokens=LLM_MAX_TOKENS)
     logger.info("%s eşleşme, %s tanesi LLM'e sorulacak.", len(df), len(todo))
     errors = ask_matches(todo, llm, cache)
     df = ews_olay.apply_results(df, cache, errors)

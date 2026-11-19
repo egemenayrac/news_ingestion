@@ -9,20 +9,19 @@ Stage 1), alıntının haberde geçip geçmediğine kod bakar.
 
 from __future__ import annotations
 
-import importlib
 import re
 from typing import Dict, Optional, Tuple
 
 import pandas as pd
 
-eslestirme = importlib.import_module("3_eslestirme")  # adı rakamla başladığı için "import" ile alınamaz
+from ews import eslestirme
 
 PROMPT_SURUMU = "5"          # önbellek anahtarının parçası: alaka ya da olay prompt'u değişince artırın
 
 STAGE_LABEL = {3: "Kırmızı Alarm (Stage 3 Sinyali)", 2: "Yakın İzleme (Stage 2)", 1: "Düşük Risk (Stage 1)"}
 STAGE_NO = {v: k for k, v in STAGE_LABEL.items()}    # stage etiketi -> 1/2/3
 SEVIYE_NO = {"MODERATE": 1, "HIGH": 2, "CRITICAL": 3}  # olay seviyesi -> stage (seviyesiz tip de Stage 1)
-STAGE2_ESIK, STAGE3_ESIK = 25, 65  # 0-100 skor -> stage; haber ve finansal skor için aynı
+STAGE2_ESIK, STAGE3_ESIK = 25, 65  # 0-100 haber skoru -> stage (finansal skor eşikleri ews/financial.py'de 50/80'dir)
 
 
 def score_stage(skor) -> Optional[int]:
@@ -173,8 +172,10 @@ _TIPLER = "\n".join(f"  {k}: {tanim}" + (f" | DAHİL DEĞİL: {haric}" if haric 
 # LLM'e sorma
 # =============================================================================
 def pair_keys(df: pd.DataFrame) -> pd.Series:
-    """Önbellek anahtarı: haberin tekilleştirme anahtarı | şirket | prompt sürümü."""
-    return eslestirme.build_dedup_keys(df) + "|" + df["Şirket"].astype(str) + "|" + PROMPT_SURUMU
+    """Önbellek anahtarı: haberin tekilleştirme anahtarı | şirket (ortak eşleşmesiyse +ortak) | prompt sürümü.
+    Doğrudan şirket eşleşmelerinde eski anahtar biçimi korunur; ortak üzerinden eşleşmede ortak adı anahtara eklenir."""
+    ortak_ek = df["Ortak"].fillna("").astype(str).map(lambda o: f":{o.split(' (')[0]}" if o.strip() else "") if "Ortak" in df.columns else ""
+    return eslestirme.build_dedup_keys(df) + "|" + df["Şirket"].astype(str) + ortak_ek + "|" + PROMPT_SURUMU
 
 
 def _pick(value: object, allowed, default: str) -> str:

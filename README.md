@@ -1,40 +1,61 @@
 # Kurumsal Kredi Riski Erken Uyarı Sistemi (EWS)
 
-Bir bankanın kurumsal kredi portföyü için erken uyarı sistemi. Ekonomi basınındaki haberleri portföy şirketleriyle
-(ve hakim ortaklarıyla) eşleştirir, her eşleşmeyi bankanın iç LLM'ine okutup **kanıtlı olaylar** (konkordato, haciz,
+Bir bankanın kurumsal kredi portföyü için erken uyarı sistemi. Ekonomi basınındaki haberleri ve resmi ilanları
+(İlan.gov.tr konkordato/iflas tebligatları, Resmî Gazete ihale yasaklıları) portföy şirketleriyle (ve hakim
+ortaklarıyla) eşleştirir, her eşleşmeyi bankanın iç LLM'ine okutup **kanıtlı olaylar** (konkordato, haciz,
 soruşturma, zarar…) çıkarır, olayları şirket başına bir defterde açık/kapanmış olarak izler ve bunu DWH'taki
-finansallardan hesaplanan kural bazlı bir finansal skorla birleştirir. Çıktı bir Excel dosyası ve tek dosyalık bir
+finansallardan hesaplanan üç katmanlı finansal skorla birleştirir. Çıktı bir Excel dosyası ve tek dosyalık bir
 HTML paneldir.
 
 LLM seviye ya da puan vermez: kapalı bir listeden olay tipi seçer ve haberden birebir alıntı yapar; alıntıyı ve seviyeyi
 kod denetler.
 
+## Proje Yapısı
+
+```text
+news_ingestion/
+├── baslat.py                # Tek tuş ("idiot-proof") başlatıcı: paket/veri sağlığı kontrolü + etkileşimli menü (Spyder F5)
+├── ayarlar.py               # Merkezi ayarlar (LLM, Oracle, Proxy, dosya yolları ve akıllı şifre/anahtar yardımcıları)
+├── 1_scraper.py             # Ekonomi basınından haber toplama -> news.parquet (kümülatif)
+├── 2_sql_to_parquet.py      # Oracle DWH: portföy, finansallar, hakim ortaklar -> structured_data.parquet, portfolio_config.py
+├── 3_llm_dogrulama.py       # Ana EWS orkestratörü: eşleştirme -> LLM -> olay defteri -> finansal skor -> Excel + dashboard.html
+├── 4_resmi_ilanlar.py       # İlan.gov.tr (Konkordato/İflas) ve Resmî Gazete (İhale Yasaklıları) tarayıcısı -> news.parquet
+├── 5_backtest.py            # Backtesting, kurşun süresi (lead time) ve dwh_agent (kb.sqlite) entegrasyonu
+├── ews/                     # Çekirdek kütüphane paketi (doğrudan çalıştırılmaz, import edilir)
+│   ├── __init__.py
+│   ├── text.py              # Türkçe karakter normalizasyonu ve offset koruma
+│   ├── eslestirme.py        # Trie regex ile şirket/ortak/ticker eşleştirme ve çoklu kesit (snippet) çıkarma
+│   ├── llm.py               # OpenAI uyumlu LLM istemcisi, /v1/moderations anlamsal benzerlik ve JSONL önbellek
+│   ├── olay.py              # Olay sözlüğü, alaka/olay prompt'ları, alıntı kontrolü
+│   ├── defter.py            # Şirket bazlı durumsal olay defteri (yeni / mevcut / kapat) ve haber skoru
+│   ├── financial.py         # Üç katmanlı finansal skorlama modeli (Seviye, Dayanıklılık, Trend)
+│   ├── portfoy.py           # Birlesik tablo (2B Risk Matrisi dahil) ve açık uçlu dinamik Temalar keşfi
+│   ├── tablolar.py          # Excel sayfaları, analist kontrol örneklem hasadı ve alias önerileri
+│   └── dashboard.py         # Sıfır bağımlılıklı tek dosya HTML erken uyarı paneli
+└── docs/                    # Tasarım, kural ve yol haritası belgeleri
+    ├── DEGISIKLIKLER.md     # v2 mimari yeniden yapılandırma, hata düzeltmeleri ve yeni özellik kayıtları
+    ├── PROJE_ACIKLAMASI.md
+    ├── SKORLAMA_KURALLARI.md
+    ├── 4_llm_dogrulama_ACIKLAMA.md
+    └── SONRAKI_ADIMLAR.md
+```
+
 ## Belgeler
 | Belge | İçerik |
 |---|---|
-| [PROJE_ACIKLAMASI.md](PROJE_ACIKLAMASI.md) | **Buradan başlayın.** Motivasyon, mimari, gelişim kronolojisi, kararlar ve gerekçeleri, ölçümler, açık sorunlar |
-| [SKORLAMA_KURALLARI.md](SKORLAMA_KURALLARI.md) | Seviye ve skor kurallarının kısa, kesin hali |
-| [4_llm_dogrulama_ACIKLAMA.md](4_llm_dogrulama_ACIKLAMA.md) | LLM katmanının ayrıntısı, Excel kolon sözlüğü, karar kaydı (kısmen eski) |
-| [SONRAKI_ADIMLAR.md](SONRAKI_ADIMLAR.md) | Yol haritası |
+| [docs/DEGISIKLIKLER.md](docs/DEGISIKLIKLER.md) | **Yeni (v2):** Paket mimarisi, `ayarlar.py`, `baslat.py`, `build_themes` tamiri, resmi ilanlar ve backtest notları |
+| [docs/PROJE_ACIKLAMASI.md](docs/PROJE_ACIKLAMASI.md) | Motivasyon, mimari, gelişim kronolojisi, kararlar ve gerekçeleri, ölçümler, açık sorunlar |
+| [docs/SKORLAMA_KURALLARI.md](docs/SKORLAMA_KURALLARI.md) | Seviye ve skor kurallarının kısa, kesin hali |
+| [docs/4_llm_dogrulama_ACIKLAMA.md](docs/4_llm_dogrulama_ACIKLAMA.md) | LLM katmanının ayrıntısı, Excel kolon sözlüğü, karar kaydı |
+| [docs/SONRAKI_ADIMLAR.md](docs/SONRAKI_ADIMLAR.md) | Yol haritası |
 
-## Akış
-```
-1_scaper.py          haber sitelerinden son günlerin haberleri  -> news.parquet (kümülatif)
-2_sql_to_parquet.py  Oracle: portföy, finansallar, hakim ortaklar -> structured_data.parquet, portfolio_config.py
-4_llm_dogrulama.py   eşleştirme (3_eslestirme) -> LLM soruları -> olay defteri -> finansal skor -> Excel + dashboard.html
-```
-Günlük: `1_scaper.py`, sonra `4_llm_dogrulama.py`. `2_sql_to_parquet.py` portföy ya da finansallar değiştiğinde.
-
-## Bu depo hakkında
-Paylaşılabilir kopyadır:
-- Banka altyapısına ait adlar yer tutucudur: `<ORACLE_HOST>`, `<ORACLE_USER>`, `<SERVICE_NAME>`, `<SEMA>`, `<PROXY_HOST>:<PORT>`,
-  LLM adresi `<SUNUCU>`. Çalıştırmadan önce doldurulur; şifreler ve API anahtarları dosyaya yazılıp depoya gönderilmez.
-- `2_sql_to_parquet.py`'deki `ALIAS_RULES` örnek satırlardan oluşur.
-- Bankanın ve iç platformun adları çıkarıldı; bankaya özgü DWH sütun adları genelleştirildi
-  (`cash_bal_bank`, `bank_fx_deposit`…). Gerçek kurulumda sorgu ve sütun adları kurumun DWH'ına göre uyarlanır.
-- Müşteri verisi içeren dosyalar (`portfolio_config.py`, `structured_data.parquet`, `news.parquet`, Excel çıktıları,
-  `llm_cache.jsonl`, `kontrol_etiketleri.jsonl`, `dashboard*.html/jsonl`) depoda yoktur ve `.gitignore`'dadır.
-- Belgelerde müşteri adları "Şirket A, B…" ile değiştirildi, portföye ait sayılar genelleştirildi.
+## Nasıl Çalıştırılır? (Hızlı Başlangıç)
+1. Sunucu adreslerinizi [`ayarlar.py`](ayarlar.py) içine (veya Git'e girmeyen kişisel `ayarlar_local.py` dosyanıza) yazın. Şifre ve API anahtarını dosyaya yazmanıza gerek yoktur; ilk çalıştırmada sorulur.
+2. Spyder'da (F5) veya terminalde doğrudan **`baslat.py`** dosyasını çalıştırın:
+   ```bash
+   python baslat.py
+   ```
+   `baslat.py` eksik kütüphaneleri ve veri dosyalarının güncelliğini kontrol edip etkileşimli menüyü açar.
 
 ## Gereksinimler
 Python 3.11+; `pandas`, `pyarrow`, `openpyxl`, `requests`, `urllib3`, `beautifulsoup4`, `oracledb`.

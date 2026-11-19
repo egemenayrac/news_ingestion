@@ -147,7 +147,7 @@ BALANCE_COLUMNS = ("cash_bal_bank", "noncash_bal_bank")
 BALANCE_OUTPUT_COLUMNS = ["Toplam_Bakiye_TRY", "Nakit_Bakiye_TRY", "Gayrinakit_Bakiye_TRY"]
 # Borçluların bu oranından fazlasında toplam bakiye 0 ya da boşsa kolonların anlamı kontrol edilmelidir.
 BALANCE_EMPTY_WARN_SHARE = 0.5
-STRUCTURED_PARQUET_PATH = Path(__file__).resolve().parent / "structured_data.parquet"
+STRUCTURED_PARQUET_PATH = Path(__file__).resolve().parent.parent / "structured_data.parquet"
 
 
 # =============================================================================

@@ -17,7 +17,7 @@ from typing import Dict, List, Tuple
 
 import pandas as pd
 
-from ews_olay import ILGILI, SEVIYE_NO, STAGE2_ESIK, STAGE3_ESIK, eslestirme, tip_seviyesi
+from ews.olay import ILGILI, SEVIYE_NO, STAGE2_ESIK, STAGE3_ESIK, eslestirme, tip_seviyesi
 
 DEFTER_SURUMU = "1"          # önbellek anahtarının parçası: defter prompt'u değişince artırın
 
@@ -59,6 +59,7 @@ class Olay:
     kapanis_alinti: str = ""
     haberler: List[dict] = field(default_factory=list)  # {tarih, kaynak, url, anahtar, islem}
     eski: bool = False        # son haberi ESKI_OLAY_GUN'den eski (build_ledgers işaretler)
+    tekil_kapanis: bool = False  # öncesinde açık bir olay haberi olmadan doğrudan yalanlama/kapanışla oluştuysa True
 
     @property
     def acik(self) -> bool:
@@ -66,11 +67,17 @@ class Olay:
 
     @property
     def stage(self) -> int:
-        """Olayın şirket sinyaline etkisi: açık CRITICAL 3, HIGH 2; kapanan ve eskiyen olay birer kademe düşer (en az 1)."""
+        """Olayın şirket sinyaline etkisi: açık CRITICAL 3, HIGH 2; kapanan ve eskiyen olay birer kademe düşer (en az 1).
+        Öncesinde açık bir olay olmadan tek başına gelen yalanlama/kapanış haberi alarm üretmez (Stage 1)."""
+        if self.tekil_kapanis and not self.acik:
+            return 1
         return max(1, SEVIYE_NO[self.seviye] - (0 if self.acik else 1) - (1 if self.eski else 0))
 
     def durum_metni(self) -> str:
-        durum = "açık" if self.acik else f"kapandı {self.kapanis}"
+        if self.tekil_kapanis and not self.acik:
+            durum = f"yalanlandı/kapandı {self.kapanis} (öncesinde açık haber yok)"
+        else:
+            durum = "açık" if self.acik else f"kapandı {self.kapanis}"
         return durum + (f" · son haber {ESKI_OLAY_GUN}+ gün önce" if self.eski else "")
 
     def satir(self) -> str:
@@ -121,11 +128,11 @@ def build_ledger(rows: List[dict], llm, cache, errors: Dict[str, str]) -> List[O
         target = next((e for e in events if e.kod == ans.get("olay")), None)
 
         if target is None or ans["islem"] not in ("mevcut", "kapat"):
-            # Yeni olay. Kapanış haberiyle açılan olay (açılışı pencere dışında kalmış) kapalı başlar.
+            # Yeni olay. Kapanış haberiyle açılan olay (öncesinde açık haber yok / tekil yalanlama) kapalı ve tekil başlar.
             haber["islem"] = "yeni"
             olay = Olay(kod=f"O{len(events) + 1}", tip=rec["LLM_Olay"], seviye=rec["_TipSeviye"],
                         risk_turu=rec["LLM_Risk_Turu"] or "kredi", tanim=rec["LLM_Ozet"], acilis=haber["tarih"],
-                        haberler=[haber])
+                        haberler=[haber], tekil_kapanis=closing)
             if closing:
                 olay.kapat(haber, rec["LLM_Alinti"])
             events.append(olay)
@@ -136,7 +143,8 @@ def build_ledger(rows: List[dict], llm, cache, errors: Dict[str, str]) -> List[O
             haber["islem"] = "kapat"
         else:
             haber["islem"] = "mevcut"
-        if not closing:  # kapanış / yalanlama haberi olayı ağırlaştırmaz
+        if not closing:  # kapanış / yalanlama haberi olayı ağırlaştırmaz; gerçek olay haberi geldiyse tekil_kapanis kalkar
+            target.tekil_kapanis = False
             if SEVIYE_NO[rec["_TipSeviye"]] > SEVIYE_NO[target.seviye]:  # ağırlaşan olay (dava -> haciz)
                 target.seviye, target.tip = rec["_TipSeviye"], rec["LLM_Olay"]
             if rec["LLM_Risk_Turu"] == "kredi":
@@ -181,11 +189,11 @@ def annotate(df: pd.DataFrame, ledgers: Dict[object, List[Olay]]) -> pd.DataFram
 # =============================================================================
 # Haber skoru (0-100)
 # =============================================================================
-# Seviyeyi defter kuralı belirler (Olay.stage); skor, o seviyenin bandı içinde şirketleri sıralar. Bantlar finansal
-# skorla aynı eşiklerden gelir, bu yüzden birleşik skor = max(haber, finansal) birleşik seviyeyle hep tutarlıdır.
-# Değerler ayardır: kesinlik iddiası yoktur, sıralamayı makul kılmak için seçildi.
+# Seviyeyi defter kuralı belirler (Olay.stage); skor, o seviyenin bandı içinde şirketleri sıralar.
+# Finansal skor (50/80 eşikli) Birlesik tablosunda haber ölçeğine (25/65 eşikli) doğrusal çevrilir.
 OLAY_PUANI = {("CRITICAL", True): 80, ("CRITICAL", False): 45,   # (seviye, açık mı) -> puan
               ("HIGH", True): 45, ("HIGH", False): 15}
+TEKIL_KAPANIS_PUANI = 10     # öncesinde açık haber olmadan tek başına gelen yalanlama/kapanış haberi (Stage 1 bandında kalır)
 ORTA_OLAY_PUANI = 8          # odak haberdeki her farklı orta seviyeli olay tipi (kâr düşüşü, dış baskı...)
 HUKUKI_ITIBAR_CARPANI = 0.8  # ödeme gücüne etkisi henüz belirsiz olay
 TAZELIK_TAM_GUN = 90         # son haberi bu kadar gün içinde olan olay puanının tamamını alır
@@ -222,7 +230,8 @@ def news_score(events: List[Olay], orta: Dict[str, str], bugun: pd.Timestamp) ->
     for e in events:
         tazelik = freshness(_age_days(e.haberler[-1]["tarih"], bugun))
         risk = HUKUKI_ITIBAR_CARPANI if e.risk_turu == "hukuki_itibar" else 1.0
-        items.append((OLAY_PUANI[(e.seviye, e.acik)] * tazelik * risk, f"[{e.kod}] {e.tip} {'açık' if e.acik else 'kapandı'}"))
+        base = TEKIL_KAPANIS_PUANI if (e.tekil_kapanis and not e.acik) else OLAY_PUANI[(e.seviye, e.acik)]
+        items.append((base * tazelik * risk, f"[{e.kod}] {e.tip} {'açık' if e.acik else 'kapandı'}"))
     items += [(ORTA_OLAY_PUANI * freshness(_age_days(tarih, bugun)), f"orta: {t}") for t, tarih in orta.items()]
     if not items:
         return 0, ""

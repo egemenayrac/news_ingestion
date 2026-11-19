@@ -35,8 +35,10 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import pandas as pd
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from ews_text import normalize_text, normalize_with_offsets, to_original_span  # noqa: E402
+ROOT_DIR = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT_DIR))
+import ayarlar  # noqa: E402
+from ews.text import normalize_text, normalize_with_offsets, to_original_span  # noqa: E402
 
 try:
     from portfolio_config import COMPANIES  # noqa: E402
@@ -50,17 +52,18 @@ logger = logging.getLogger("ews_eslestirme")
 
 
 # =============================================================================
-# 1. Ayarlar
+# 1. Ayarlar (ayarlar.py üzerinden okunur)
 # =============================================================================
-PARQUET_PATH = str(Path(__file__).resolve().parent / "news.parquet")  # 1_scaper.py'nin yazdığı dosya (ağ klasöründeyse tam yolu)
-AGGREGATION_WINDOW_DAYS = 180    # yalnızca bu penceredeki haberler eşleştirilir (haber skoru 90-180 gün arası azalır)
+PARQUET_PATH = str(ayarlar.NEWS_PARQUET_PATH)
+AGGREGATION_WINDOW_DAYS = ayarlar.AGGREGATION_WINDOW_DAYS
 MIN_HAVUZ_GUN = 30              # haber havuzu bundan az günü kapsıyorsa uyarı yazılır
 SCORE_UNDATED_NEWS = False       # tarihi okunamayan haber: False ise atlanır (sayısı uyarı olarak yazılır)
 SNIPPET_WORDS_BEFORE = 25        # şirket adından önce alınan kelime
 SNIPPET_WORDS_AFTER = 60         # şirket adından sonra alınan kelime
+MAX_SNIPPETS_PER_ARTICLE = 3     # aynı haberde şirketin birden çok geçişi varsa birleştirilecek en fazla kesit
 REPORTING_TZ = "Europe/Istanbul"  # saat dilimli tarihler bu saate çevrilir
 DATE_DAYFIRST = True             # "05.09.2026" gün-ay-yıl okunur; ISO tarihler etkilenmez
-ESLESTIRME_SURUMU = "1.0"
+ESLESTIRME_SURUMU = "1.1"
 REQUIRED_COLUMNS = {"Başlık", "Metin", "Tarih"}
 
 
@@ -265,16 +268,32 @@ def match_companies(text: str, headline_end: Optional[int] = None) -> List[dict]
 
 
 def match_record(baslik: str, metin: str) -> List[dict]:
-    """Tek haberin eşleşmeleri; şirket başlıkta da geçiyorsa başlıktaki kesit gövde kesitinin başına eklenir."""
+    """Tek haberin eşleşmeleri; şirket başlıkta da geçiyorsa başlıktaki kesit gövde kesitinin başına eklenir.
+    Aynı şirket gövdede farklı paragraflarda birden çok kez geçiyorsa ilk MAX_SNIPPETS_PER_ARTICLE kesit birleştirilir."""
     baslik, metin = baslik.strip(), metin.strip()
     text = f"{baslik}\n{metin}" if baslik and metin else (baslik or metin)
     headline = {r["company_key"]: r for r in match_companies(baslik)} if baslik else {}
-    results = []
+    by_company: Dict[object, dict] = {}
+    snippets_by_company: Dict[object, List[str]] = {}
     for r in match_companies(text, headline_end=len(baslik) if baslik else 0):
-        head = headline.get(r["company_key"])
-        if r["in_headline"] and head and head["snippet"] and head["snippet"] not in r["snippet"]:
-            r["snippet"] = f"{head['snippet']}\n{r['snippet']}"
-        results.append(r)
+        ck = r["company_key"]
+        if ck not in by_company:
+            by_company[ck] = dict(r)
+            head = headline.get(ck)
+            init_snips = []
+            if r["in_headline"] and head and head["snippet"] and head["snippet"] not in r["snippet"]:
+                init_snips.append(head["snippet"])
+            if r["snippet"]:
+                init_snips.append(r["snippet"])
+            snippets_by_company[ck] = init_snips
+        else:
+            snips = snippets_by_company[ck]
+            if r["snippet"] and len(snips) < MAX_SNIPPETS_PER_ARTICLE and all(r["snippet"] not in s and s not in r["snippet"] for s in snips):
+                snips.append(r["snippet"])
+    results = []
+    for ck, rec in by_company.items():
+        rec["snippet"] = "\n...\n".join(snippets_by_company.get(ck, []))
+        results.append(rec)
     return results
 
 
