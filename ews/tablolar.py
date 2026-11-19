@@ -14,8 +14,8 @@ from typing import Dict, List, Tuple
 
 import pandas as pd
 
-from ews_defter import Olay, news_score
-from ews_olay import ILGILI, LLM_COLUMNS, RED, STAGE_LABEL, STAGE_NO, answered, fold, tip_seviyesi
+from ews.defter import Olay, news_score
+from ews.olay import ILGILI, LLM_COLUMNS, RED, STAGE_LABEL, STAGE_NO, answered, fold, tip_seviyesi
 
 logger = logging.getLogger("ews_llm")
 

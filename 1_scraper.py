@@ -26,22 +26,22 @@ from bs4 import BeautifulSoup
 warnings.filterwarnings("ignore", category=UserWarning, module='bs4')
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
+import ayarlar
+
 # =============================================================================
-# 1. YAPILANDIRMA VE DOSYA YOLU AYARLARI
+# 1. YAPILANDIRMA VE DOSYA YOLU AYARLARI (ayarlar.py üzerinden okunur)
 # =============================================================================
 
-NETWORK_MODE = "BANK"           # Ağ yönlendirme yapılandırması ('HOME' veya 'BANK')
-PROXY_HOST = "<PROXY_HOST>:<PORT>"   # kurumsal proxy (BANK modunda)
-LOOKBACK_DAYS = 10              # Geriye dönük taranacak maksimum gün sayısı
-ENABLE_KAP_CRAWLING = False     # KAP resmi bildirim API entegrasyonu aktif
-MAX_WORKERS = 8                 # Asenkron HTTP istekleri için ayrılan thread sayısı
+NETWORK_MODE = ayarlar.NETWORK_MODE
+PROXY_HOST = ayarlar.PROXY_HOST
+LOOKBACK_DAYS = ayarlar.LOOKBACK_DAYS
+ENABLE_KAP_CRAWLING = ayarlar.ENABLE_KAP_CRAWLING
+MAX_WORKERS = ayarlar.SCRAPER_MAX_WORKERS
 TIME_LIMIT = datetime.now(timezone.utc) - timedelta(days=LOOKBACK_DAYS)
 
-# Parquet Veri Havuzu Dizin ve Dosya Yapılandırması
-SCRIPT_DIR = str(pathlib.Path(__file__).parent.resolve())
-PARQUET_DIR = SCRIPT_DIR             # 3_eslestirme.py aynı klasördeki news.parquet'i okur
+PARQUET_DIR = str(ayarlar.NEWS_PARQUET_PATH.parent)
 os.makedirs(PARQUET_DIR, exist_ok=True)
-PARQUET_PATH = os.path.join(PARQUET_DIR, "news.parquet")
+PARQUET_PATH = str(ayarlar.NEWS_PARQUET_PATH)
 
 # Haber Kaynakları Konfigürasyonu
 SOURCES = {
@@ -78,19 +78,16 @@ class HybridSession(requests.Session):
         return super().request(method, url, **kwargs)
 
 def create_configured_session() -> HybridSession:
-    proxy_url = None
-    bypass_list = ["cnbce.com"] 
-    if NETWORK_MODE.strip().upper() in ["BANK", "BANKA"]:
-        print("\n[BİLGİ] Ağ Modu: BANK (Güvenli kurumsal proxy yönlendirmesi aktif)")
-        proxy_user = input("Proxy Kullanıcı Adı: ").strip()
-        proxy_pass = getpass.getpass("Proxy Şifresi: ") 
-        if proxy_user and proxy_pass:
-            proxy_url = f"http://{quote(proxy_user, safe='')}:{quote(proxy_pass, safe='')}@{PROXY_HOST}"
-    else:
-        print("\n[BİLGİ] Ağ Modu: HOME (Doğrudan bağlantı aktif)\n")
-    return HybridSession(proxy_url=proxy_url, bypass_domains=bypass_list)
+    proxy_url = ayarlar.get_proxy_url(interactive=True)
+    return HybridSession(proxy_url=proxy_url, bypass_domains=ayarlar.PROXY_BYPASS_DOMAINS)
 
-SESSION = create_configured_session()
+_SESSION: HybridSession | None = None
+
+def get_session() -> HybridSession:
+    global _SESSION
+    if _SESSION is None:
+        _SESSION = create_configured_session()
+    return _SESSION
 
 # =============================================================================
 # 3. YARDIMCI VERİ VE KAP DECODER METOTLARI
@@ -108,17 +105,19 @@ def parse_date(date_str: str) -> datetime:
         return None
 
 def get_soup_with_retry(url: str, retries: int = 3) -> BeautifulSoup:
+    session = get_session()
     for _ in range(retries):
         try:
-            res = SESSION.get(url, timeout=(5, 15)) 
+            res = session.get(url, timeout=(5, 15)) 
             if res.status_code == 200: return BeautifulSoup(res.content, 'html.parser')
         except: time.sleep(1) 
     return None
 
 def get_content_with_retry(url: str, retries: int = 3) -> str:
+    session = get_session()
     for _ in range(retries):
         try:
-            res = SESSION.get(url, timeout=(5, 20))
+            res = session.get(url, timeout=(5, 20))
             if res.status_code == 200:
                 content = res.content
                 if content.startswith(b'\x1f\x8b'):  
@@ -219,15 +218,16 @@ def fetch_kap_disclosures(existing_urls: set) -> list:
     today = datetime.now(timezone.utc)
     start_date = today - timedelta(days=LOOKBACK_DAYS)
     
+    session = get_session()
     try:
-        SESSION.get("https://www.kap.org.tr/tr/", timeout=15)
+        session.get("https://www.kap.org.tr/tr/", timeout=15)
         current_date = start_date
         while current_date <= today:
             date_str = current_date.strftime("%d.%m.%Y")
             print(f"    -> KAP Tarih: {date_str}...", end=" ", flush=True)
             payload = {"fromDate": date_str, "toDate": date_str, "memberTypes": ["IGS", "DDK"]}
             try:
-                res = SESSION.post("https://www.kap.org.tr/tr/api/disclosure/list/main", json=payload, timeout=15)
+                res = session.post("https://www.kap.org.tr/tr/api/disclosure/list/main", json=payload, timeout=15)
                 if res.status_code == 200:
                     data = res.json()
                     print(f"Kayıt: {len(data)}")
@@ -247,7 +247,7 @@ def fetch_kap_disclosures(existing_urls: set) -> list:
                         
                         tam_metin = (summary if summary else f"Resmi Bildirim: {subject}").strip()
                         try:
-                            detail_res = SESSION.get(kap_url, timeout=15)
+                            detail_res = session.get(kap_url, timeout=15)
                             if detail_res.status_code == 200:
                                 flight_data = kapweb_next_data(detail_res.text)
                                 if flight_data:

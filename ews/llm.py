@@ -88,6 +88,30 @@ class LLMClient:
                 time.sleep(wait + random.uniform(0, 3))  # rastgele pay: iki iş parçacığı aynı anda tekrar denemesin
         return None, last
 
+    def similarity(self, text: str, categories: list, threshold: float = 0.5) -> Optional[Dict[str, float]]:
+        """Kurumsal /v1/moderations (paraphrase-multilingual-mpnet-base-v2) uç noktasından anlamsal benzerlik skorlarını alır.
+        Endpoint kapalıysa ya da hata verirse None döner (akışı kırmaz)."""
+        if not text or not categories or "<SUNUCU>" in self.url:
+            return None
+        mod_url = self.url.replace("/chat/completions", "/moderations")
+        key = re.sub(r"^bearer\s+", "", str(self.key or "").strip(), flags=re.I)
+        headers = {"Authorization": f"Bearer {key}"} if key else {}
+        payload = {
+            "input": str(text)[:500],
+            "categories": [str(c)[:300] for c in categories],
+            "flag_threshold": threshold,
+            "moderations_disabled": False,
+        }
+        try:
+            r = requests.post(mod_url, json=payload, headers=headers, timeout=min(self.timeout, 30), verify=self.verify)
+            if r.ok:
+                results = r.json().get("results") or []
+                if results and isinstance(results[0].get("category_scores"), dict):
+                    return {str(k): float(v) for k, v in results[0]["category_scores"].items()}
+        except Exception:
+            return None
+        return None
+
 
 def _parse(body: dict) -> Tuple[Optional[dict], str]:
     """Chat cevabından JSON sözlüğü çıkarır. JSON bozuksa ValueError (tekrar denenir)."""

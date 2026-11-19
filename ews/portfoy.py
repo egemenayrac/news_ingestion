@@ -15,9 +15,9 @@ from typing import Optional
 
 import pandas as pd
 
-from ews_financial import (FIN_STAGE2_ESIK, FIN_STAGE3_ESIK, FINANCIAL_API_VERSION, build_financial_scores,
+from ews.financial import (FIN_STAGE2_ESIK, FIN_STAGE3_ESIK, FINANCIAL_API_VERSION, build_financial_scores,
                            describe_points, financial_stage)
-from ews_olay import ILGILI, STAGE2_ESIK, STAGE3_ESIK, SEVIYE_NO, STAGE_LABEL, STAGE_NO, fold, tip_seviyesi
+from ews.olay import ILGILI, STAGE2_ESIK, STAGE3_ESIK, SEVIYE_NO, STAGE_LABEL, STAGE_NO, fold, tip_seviyesi
 
 logger = logging.getLogger("ews_llm")
 
@@ -25,22 +25,19 @@ logger = logging.getLogger("ews_llm")
 # =============================================================================
 # Birlesik: haber sinyali + finansal skor + bakiye
 # =============================================================================
-STRUCTURED_PARQUET_PATH = Path(__file__).resolve().parent / "structured_data.parquet"
-REQUIRED_FINANCIAL_API = 5   # beklenen ews_financial.py sürümü (üç katmanlı model)
+STRUCTURED_PARQUET_PATH = Path(__file__).resolve().parent.parent / "structured_data.parquet"
+REQUIRED_FINANCIAL_API = 5   # beklenen ews/financial.py sürümü (üç katmanlı model)
 KAPSAM_UYARI_ESIK = 0.5      # finansal veri kapsamı bunun altındaysa skor bir alt sınırdır; Not'ta işaretlenir
 if FINANCIAL_API_VERSION < REQUIRED_FINANCIAL_API:
-    raise ImportError(f"ews_financial.py eski sürüm (API {FINANCIAL_API_VERSION}, beklenen en az {REQUIRED_FINANCIAL_API}).")
+    raise ImportError(f"ews/financial.py eski sürüm (API {FINANCIAL_API_VERSION}, beklenen en az {REQUIRED_FINANCIAL_API}).")
 
 
 def load_financials(path: Path = STRUCTURED_PARQUET_PATH) -> pd.DataFrame:
-    """structured_data.parquet'ten ews_financial ile finansal skor tablosu (borçlu başına bir satır); dosya yoksa boş."""
+    """structured_data.parquet'ten ews.financial ile finansal skor tablosu (borçlu başına bir satır); dosya yoksa boş."""
     if not Path(path).exists():
         logger.warning("Finansal veri yok (%s); Birlesik sayfası yalnızca haber sinyaliyle üretilir.", path)
         return pd.DataFrame()
     return build_financial_scores(path)
-
-
-
 
 
 def _haber_olcegi(fin_skor: float) -> float:
@@ -80,14 +77,18 @@ def _rule(haber: int, finansal: int, birlesik: int, kar_kurali: bool) -> str:
     return "haber skoru" if haber == birlesik else "finansal skor"
 
 
+def _risk_matrisi(haber: int, finansal: Optional[int]) -> str:
+    """2 Boyutlu Risk Matrisi etiketi (Finansal Dayanıklılık x Haber Şoku)."""
+    f_etiket = {3: "Bilanço Kırılgan", 2: "Bilanço İzlemede", 1: "Bilanço Sağlam"}.get(finansal or 0, "Bilanço Yok")
+    h_etiket = {3: "Kritik Haber Şoku", 2: "Yüksek Haber Sinyali", 1: "Haber Sakin"}.get(haber, "Haber Sakin")
+    return f"{f_etiket} × {h_etiket}"
+
+
 def build_combined_table(df: pd.DataFrame, companies: pd.DataFrame, fin: pd.DataFrame, zayif_dscr: float) -> pd.DataFrame:
     """Birlesik sayfası: portföydeki her şirket için tek satır, birleşik skor ve bakiyeye göre sıralı.
 
     Birleşik seviye haber ve finansal seviyenin, Birlesik_Skor haber skoru ile haber ölçeğine çevrilmiş finansal skorun
-    yükseğidir (max kuralı; haber tarafı olay defterinden). Ölçek çevrimi sayesinde Birlesik_Skor birleşik seviyeyle
-    tutarlıdır. Ek kural:
-    "odak" haberde kâr düşüşü varken finansallar zayıfsa haber sinyali Stage 2'ye (skoru en az STAGE2_ESIK'e) çıkar: kâr düşüşünün ağırlığına bilanço karar verir (kaldıraçlı şirkette önemlidir, nakdi bol
-    şirkette değildir).
+    yükseğidir (max kuralı; haber tarafı olay defterinden). Ayrıca 2 boyutlu Risk_Matrisi (Bilanço x Haber) üretilir.
     """
     news = companies.set_index("Şirket")
     finx = fin.set_index("Şirket") if len(fin) else pd.DataFrame()
@@ -112,7 +113,9 @@ def build_combined_table(df: pd.DataFrame, companies: pd.DataFrame, fin: pd.Data
         birlesik_skor = max(haber_skor or 0, 0 if fin_skor is None or pd.isna(fin_skor) else _haber_olcegi(fin_skor))
         rows.append({
             "Şirket": key, "Şirket_Adi": n["Şirket_Adi"] if n is not None else f.get("Finansal_Unvan"),
-            "Birlesik_Seviye": STAGE_LABEL[birlesik], "Birlesik_Skor": birlesik_skor, "Birlesik_Kural": _rule(haber, finansal or 1, birlesik, kar_kurali),
+            "Birlesik_Seviye": STAGE_LABEL[birlesik], "Birlesik_Skor": birlesik_skor,
+            "Birlesik_Kural": _rule(haber, finansal or 1, birlesik, kar_kurali),
+            "Risk_Matrisi": _risk_matrisi(haber, finansal),
             "Toplam_Bakiye_TRY": _get(f, "Toplam_Bakiye_TRY"),
             "Haber_Sinyali": STAGE_LABEL[haber] if n is not None else None, "Haber_Skoru": haber_skor,
             "Skor_Hesabi": hesap,
@@ -131,63 +134,94 @@ def build_combined_table(df: pd.DataFrame, companies: pd.DataFrame, fin: pd.Data
 
 
 # =============================================================================
-# Temalar: birden çok müşteriyi etkileyen ortak gelişmeler
+# Temalar: birden çok müşteriyi etkileyen ortak gelişmeler (Açık Uçlu Keşif + İkili Doğrulama)
 # =============================================================================
-TEMA_SURUMU = "2"            # önbellek anahtarının parçası: tema prompt'u değişince artırın
-TEMA_MAKS_MADDE = 300        # LLM'e gönderilecek en fazla olay (en ağırları önce)
-SYSTEM_TEMA = ("Sen bir bankanın kredi riski analistisin. Portföydeki şirketlerin olaylarından birden fazla "
-               "şirketi etkileyen ortak temaları buluyorsun. Yalnızca JSON döndür; açıklama yazma.")
-TEMA_PROMPT = """Aşağıda bankanın müşterisi olan şirketlerin son dönemdeki olayları var.
+TEMA_SURUMU = "3"            # önbellek anahtarının parçası: tema prompt'u değişince artırın
+TEMA_MAKS_MADDE = 250        # LLM'e gönderilecek en fazla olay (en ağırları ve en yenileri önce)
+TEMA_EMBED_ESIK = 0.55       # /v1/moderations (paraphrase-multilingual-mpnet-base-v2) anlamsal benzerlik eşiği
+SYSTEM_TEMA = (
+    "Sen bir bankanın kredi riski analistisin. Portföydeki şirketlerin haberlerinden birden fazla "
+    "şirketi etkileyen ortak gelişmeleri, sektörel/makro şokları, düzenleyici kararları ya da ortak soruşturmaları "
+    "keşfediyorsun. Yalnızca JSON döndür; açıklama yazma."
+)
+TEMA_PROMPT = """Aşağıda bankanın müşterisi olan şirketlerin son dönemdeki risk olayları yer alıyor.
 Her satır: [no] şirket | olay tipi | özet | haberden alıntı
 
 {maddeler}
 
 ---
-Birden fazla şirketi etkileyen ORTAK bir gelişme varsa grupla. Ortak gelişme somut olmalı: aynı soruşturma ya da
-dava, aynı kurum kararı, aynı vergi ya da düzenleme, aynı fiyat ya da talep şoku. Kurallar:
-- Yalnızca satırlarda YAZAN bilgiyi kullan. Satırlarda geçmeyen bir olayı, kurumu, vergiyi ya da kavramı tema adına
-  ya da açıklamaya koyma; kendi bilgini ekleme.
-- Temadaki her madde ortak gelişmeyi kendi özetinde ya da alıntısında açıkça anmalı. Yalnızca aynı sektörde olmak ya
-  da aynı olay tipine sahip olmak tema değildir.
-- "ortak_ifade": temadaki bütün maddelerde geçen, ortak gelişmeyi gösteren kısa ifade; maddelerdeki kelimelerle yaz.
-- Bir tema en az 2 FARKLI şirketi kapsamalı; her madde en fazla bir temaya girer. Emin değilsen maddeyi dışarıda
-  bırak. Ortak gelişme yoksa boş liste döndür.
+Birden fazla şirketi (en az 2 FARKLI şirketi) etkileyen ORTAK gelişmeleri veya risk temalarını bul ve grupla.
+Ortak gelişme şunlardan biri olabilir:
+  1. Aynı kurum soruşturması, yargı süreci veya düzenleyici karar (Rekabet Kurumu, SPK, BDDK, MASAK, TMSF, vergi incelemesi vb.)
+  2. Aynı sektörel/makro şok, maliyet/kur/talep baskısı, ihracat/gümrük engeli, tedarik veya enerji krizi
+  3. Aynı ticari ağdaki zincirleme kriz, grev/sendika uyuşmazlığı veya ortak finansal darboğaz
 
-{{"temalar": [{{"tema": "<kısa ad>", "aciklama": "<tek cümle>", "ortak_ifade": "<kısa ifade>", "maddeler": [<no>, <no>]}}]}}
+Kurallar:
+- Önceden tanımlı bir şablona bağlı kalma; yalnızca yukarıdaki satırlarda gördüğün somut ortak gelişmeleri çıkar.
+- Farklı haberler aynı konuyu farklı kelimelerle anlatabilir (ör. biri "soruşturma", diğeri "inceleme" veya "ceza"; biri "kur baskısı", diğeri "döviz artışı"). Bu yüzden her tema için maddelerde geçen anahtar kavramları "kanit_kelimeler" listesine (2-5 kelime/ifade) yaz.
+- Bir tema en az 2 FARKLI şirketi kapsamalı; her madde en uygun tek bir temaya girmeli.
+
+{{"temalar": [{{"tema": "<kısa ve net tema başlığı>", "aciklama": "<ortak gelişmeyi açıklayan tek cümle>", "kanit_kelimeler": ["<kelime1>", "<kelime2>", "<kelime3>"], "maddeler": [<no>, <no>]}}]}}
 /no_think"""
 TEMA_COLUMNS = ["Tema", "Aciklama", "Ortak_Ifade", "Sirket_Sayisi", "Toplam_Bakiye_TRY", "En_Yuksek_Haber_Sinyali",
                 "Sirketler", "Olay_Tipleri", "Kanit", "_maddeler"]   # "_" ile başlayan kolon Excel'e yazılmaz (dashboard için)
-_DOLGU = {"icin", "olan", "ile", "veya", "gibi", "daha", "kadar", "sonra", "once", "uzere", "nedeniyle"}
+_DOLGU = {"icin", "olan", "ile", "veya", "gibi", "daha", "kadar", "sonra", "once", "uzere", "nedeniyle", "sirket", "sirketi", "haber"}
 
 
-def _mentions(ifade: str, text: str) -> bool:
-    """Ortak ifadenin anlamlı kelimelerinden en az biri (ilk 5 harfiyle, ek farkı yok sayılır) metinde geçiyor mu?"""
-    words = [w for w in (fold(x) for x in re.findall(r"[\w-]+", str(ifade))) if len(w) >= 4 and w not in _DOLGU]
-    return bool(words) and any(w[:5] in text for w in words)
+def _extract_stems(ifade_list) -> list:
+    """Kanıt kelimelerinden ya da ortak ifadeden anlamlı kelime köklerini (en az 3 harf, ilk 4-5 harf) çıkarır."""
+    if isinstance(ifade_list, str):
+        raw = ifade_list
+    elif isinstance(ifade_list, (list, tuple)):
+        raw = " ".join(str(x) for x in ifade_list)
+    else:
+        raw = str(ifade_list or "")
+    stems = []
+    for x in re.findall(r"[\w]+", raw):
+        w = fold(x)
+        if len(w) >= 3 and w not in _DOLGU:
+            stems.append(w[:5] if len(w) >= 5 else w)
+    return list(dict.fromkeys(stems))
+
+
+def _mentions_any(stems: list, text_fold: str) -> bool:
+    """Tema kanıt köklerinden en az biri maddenin başlık, özet veya alıntısında geçiyor mu?"""
+    if not stems:
+        return False
+    return any(s in text_fold for s in stems)
 
 
 def _theme_items(df: pd.DataFrame) -> pd.DataFrame:
-    """Temaya aday olaylar: odak/ikincil haberde, alıntısı doğrulanmış, seviyeli (kapanış haberleri dahil).
-    Şirket ve olay tipi başına bir madde; en ağırları ve en eskileri önce, en fazla TEMA_MAKS_MADDE."""
+    """Temaya aday olaylar: odak/ikincil haberde, alıntısı doğrulanmış, seviyeli (CRITICAL/HIGH/MODERATE).
+    Eski sürümdeki drop_duplicates(['Şirket', 'LLM_Olay']) hatası giderildi: aynı şirketin aynı olay tipindeki
+    farklı tarihli/konulu haberleri korunur; yalnızca aynı şirketin aynı özete sahip kopya haberleri tekilleştirilir."""
     level = df["LLM_Olay"].map(lambda t: SEVIYE_NO.get(tip_seviyesi(t), 0))
-    return (df[df["LLM_Alaka"].isin(ILGILI) & df["Alinti_Dogrulandi"].eq(True) & (level > 0)]
-            .assign(_lv=level).sort_values(["_lv", "Tarih"], ascending=[False, True], kind="stable")
-            .drop_duplicates(["Şirket", "LLM_Olay"]).head(TEMA_MAKS_MADDE).reset_index(drop=True))
+    sub = df[df["LLM_Alaka"].isin(ILGILI) & df["Alinti_Dogrulandi"].eq(True) & (level > 0)].copy()
+    if sub.empty:
+        return sub
+    sub["_lv"] = level.loc[sub.index]
+    sub["_ozet_k"] = sub["LLM_Ozet"].fillna("").map(lambda s: fold(s)[:35])
+    return (sub.sort_values(["_lv", "Tarih"], ascending=[False, False], kind="stable")
+            .drop_duplicates(["Şirket", "LLM_Olay", "_ozet_k"])
+            .head(TEMA_MAKS_MADDE).reset_index(drop=True))
 
 
 def build_themes(df: pd.DataFrame, companies: pd.DataFrame, fin: pd.DataFrame, llm, cache) -> pd.DataFrame:
-    """Temalar sayfası: tek LLM sorusuyla olaylar temalara ayrılır.
+    """Temalar sayfası: açık uçlu LLM keşfi + kelime kökü kümesi ve (varsa) /v1/moderations anlamsal benzerlik doğrulaması.
 
-    LLM maddeleri numaralarıyla gruplar ve her tema için bir "ortak ifade" yazar. Kod numaraları doğrular, her maddeyi
-    tek temaya koyar, ortak ifadeyi özetinde ya da alıntısında anmayan maddeyi temadan çıkarır (LLM'in maddelerde
-    olmayan bir konu uydurmasına karşı) ve 2'den az farklı şirketi kalan temayı atar. Tema başına şirket sayısı, toplam bakiye ve en yüksek haber sinyali
-    hesaplanır. LLM hata verirse sayfa boş kalır (cevap önbelleğe yazılmaz, sonraki koşuda tekrar sorulur).
+    1. LLM aday olaylardan beklenmedik ortak gelişmeleri gruplar ve her tema için `kanit_kelimeler` üretir.
+    2. Kod her maddenin başlık/özet/alıntısında bu kanıt kelimelerden en az birinin kökünü arar.
+    3. Kök eşleşmesi bulamazsa ve sunucuda `/v1/moderations` (`paraphrase-multilingual-mpnet-base-v2`) açıksa,
+       maddenin tema açıklamasına anlamsal benzerliğini ölçer (>= TEMA_EMBED_ESIK ise kabul eder).
+    4. En az 2 farklı şirketi kalan temalar toplam bakiye ve en yüksek haber sinyaliyle raporlanır.
     """
     items = _theme_items(df)
-    if items["Şirket"].nunique() < 2:
+    if items.empty or items["Şirket"].nunique() < 2:
         return pd.DataFrame(columns=TEMA_COLUMNS)
-    lines = "\n".join(f"[{i}] {r['Şirket_Adi'][:45]} | {r['LLM_Olay']} | {r['LLM_Ozet']} | \"{str(r['LLM_Alinti'])[:200]}\""
-                      for i, r in items.iterrows())
+    lines = "\n".join(
+        f"[{i}] {r['Şirket_Adi'][:45]} | {r['LLM_Olay']} | {r['LLM_Ozet']} | \"{str(r['LLM_Alinti'])[:180]}\""
+        for i, r in items.iterrows()
+    )
     key = f"TEMA|{TEMA_SURUMU}|{hashlib.md5(lines.encode('utf-8')).hexdigest()[:12]}"
     if key not in cache:
         obj, status = llm.ask(SYSTEM_TEMA, TEMA_PROMPT.format(maddeler=lines), max_tokens=4000)
@@ -199,18 +233,39 @@ def build_themes(df: pd.DataFrame, companies: pd.DataFrame, fin: pd.DataFrame, l
     bakiye = fin.set_index("Şirket")["Toplam_Bakiye_TRY"] if "Toplam_Bakiye_TRY" in fin else pd.Series(dtype=float)
     sinyal = companies.set_index("Şirket")["LLM_Sinyali"].map(STAGE_NO)
     used, rows = set(), []
-    for t in cache.get(key).get("temalar") or []:
-        ifade = str(t.get("ortak_ifade") or t.get("tema") or "")
-        nos = [int(i) for i in t.get("maddeler") or [] if str(i).strip().isdigit() and int(i) < len(items) and int(i) not in used]
-        nos = [i for i in nos if _mentions(ifade, fold(f"{items.at[i, 'LLM_Ozet']} {items.at[i, 'LLM_Alinti']}"))]
-        members = items.loc[nos]
+    for t in (cache.get(key) or {}).get("temalar") or []:
+        tema_adi = str(t.get("tema") or "").strip()
+        aciklama = str(t.get("aciklama") or "").strip()
+        kanit_list = t.get("kanit_kelimeler") or t.get("ortak_ifade") or tema_adi
+        if isinstance(kanit_list, str):
+            kanit_list = [x.strip() for x in re.split(r"[,;|]+", kanit_list) if x.strip()]
+        ortak_ifade_str = ", ".join(str(x) for x in kanit_list) if isinstance(kanit_list, list) else str(kanit_list)
+        stems = _extract_stems([tema_adi, aciklama] + (kanit_list if isinstance(kanit_list, list) else [kanit_list]))
+
+        raw_nos = [int(i) for i in (t.get("maddeler") or [])
+                   if str(i).strip().isdigit() and int(i) < len(items) and int(i) not in used]
+        verified_nos = []
+        cat_desc = f"{tema_adi}: {aciklama} ({ortak_ifade_str})"
+        for i in raw_nos:
+            item_text = f"{items.at[i, 'Başlık']} {items.at[i, 'LLM_Ozet']} {items.at[i, 'LLM_Alinti']}"
+            if _mentions_any(stems, fold(item_text)):
+                verified_nos.append(i)
+            elif hasattr(llm, "similarity"):
+                scores = llm.similarity(item_text, [cat_desc], threshold=TEMA_EMBED_ESIK)
+                if scores and scores.get(cat_desc, 0.0) >= TEMA_EMBED_ESIK:
+                    verified_nos.append(i)
+
+        members = items.loc[verified_nos]
         if members["Şirket"].nunique() < 2:
             continue
-        used.update(nos)
+        used.update(verified_nos)
         sirketler = members.drop_duplicates("Şirket")
         rows.append({
-            "Tema": str(t.get("tema", ""))[:120], "Aciklama": str(t.get("aciklama", ""))[:300], "Ortak_Ifade": ifade[:120],
-            "Sirket_Sayisi": len(sirketler), "Toplam_Bakiye_TRY": bakiye.reindex(sirketler["Şirket"]).sum(min_count=1),
+            "Tema": tema_adi[:120],
+            "Aciklama": aciklama[:300],
+            "Ortak_Ifade": ortak_ifade_str[:120],
+            "Sirket_Sayisi": len(sirketler),
+            "Toplam_Bakiye_TRY": bakiye.reindex(sirketler["Şirket"]).sum(min_count=1),
             "En_Yuksek_Haber_Sinyali": STAGE_LABEL[int(sinyal.reindex(sirketler["Şirket"]).max())],
             "Sirketler": "; ".join(sirketler["Şirket_Adi"]),
             "Olay_Tipleri": ", ".join(f"{k} ({v})" for k, v in members["LLM_Olay"].value_counts().items()),

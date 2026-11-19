@@ -10,6 +10,8 @@ llm_cache*
 kontrol_etiketleri*
 # Şifre ya da anahtar içeren yerel kopyalar
 *_local.py
+ayarlar_local.py
+.llm_key.txt
 .env
 # Python
 __pycache__/

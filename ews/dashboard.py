@@ -20,8 +20,8 @@ from typing import Dict, List, Optional
 
 import pandas as pd
 
-from ews_defter import Olay
-from ews_olay import ILGILI, PROMPT_SURUMU, SEVIYE_NO, STAGE_NO, answered, eslestirme, tip_seviyesi
+from ews.defter import Olay
+from ews.olay import ILGILI, PROMPT_SURUMU, SEVIYE_NO, STAGE_NO, answered, eslestirme, tip_seviyesi
 
 TIP_ETIKET = {
     "konkordato_iflas": "Konkordato / iflas", "temerrut": "Temerrüt", "haciz_el_koyma": "Haciz / el koyma",

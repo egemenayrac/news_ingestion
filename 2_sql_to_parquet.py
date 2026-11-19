@@ -30,27 +30,27 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import pandas as pd
 
-from ews_text import normalize_text, turkish_lower
+import ayarlar
+from ews.text import normalize_text, turkish_lower
 
 logger = logging.getLogger("ews_portfolio_config")
 SCRIPT_DIR = Path(__file__).parent
 
 
 # =============================================================================
-# 1. Ayarlar
+# 1. Ayarlar (ayarlar.py üzerinden okunur)
 # =============================================================================
-# Oracle kimlik bilgileri. Dosya paylaşılan klasörde durduğu için okuma yetkisi olan herkes şifreyi görebilir:
-# dosya izinlerini kısıtlayın, şifreyle birlikte e-postaya ya da sürüm kontrolüne göndermeyin.
-ORACLE_USER = "<ORACLE_USER>"
-ORACLE_PASSWORD = ""  # boşsa bağlantı denenmez
-ORACLE_HOST = "<ORACLE_HOST>"
-ORACLE_PORT = 1521  # bankadaki port yazılır
-ORACLE_SERVICE = "<SERVICE_NAME>"
+ORACLE_USER = ayarlar.ORACLE_USER
+ORACLE_PASSWORD = ayarlar.ORACLE_PASSWORD
+ORACLE_HOST = ayarlar.ORACLE_HOST
+ORACLE_PORT = ayarlar.ORACLE_PORT
+ORACLE_SERVICE = ayarlar.ORACLE_SERVICE
+ORACLE_SCHEMA = ayarlar.ORACLE_SCHEMA
 
 # Portföy: toplam bakiyeye (nakit + gayrinakit) göre en büyük 100 karşı taraf ve finansal göstergeleri.
-# temp8 = temp7 + trend etiketleri (yöneticinin sorgu.txt'si); son satır ews_financial'ın üç katmanlı modeli için.
+# temp8 = temp7 + trend etiketleri (yöneticinin sorgu.txt'si); son satır ews.financial'ın üç katmanlı modeli için.
 # NVL, bakiyesi NULL olan müşterilerin sıralamada öne geçmesini engeller.
-PORTFOLIO_QUERY = """SELECT part_id, counterparty_id, full_nm, cash_bal_bank, noncash_bal_bank,
+PORTFOLIO_QUERY = f"""SELECT part_id, counterparty_id, full_nm, cash_bal_bank, noncash_bal_bank,
                           cash_bal_bank_try, noncash_bal_bank_try, cash_bal_bank_usd, noncash_bal_bank_usd,
                           mmzc_cash_tl, mmzc_cash_yp, mmzc_noncash_tl, mmzc_noncash_yp,
                           bus_activity_field_code, bus_fld_code, statement_dt, equity_try, ebitda_try,
@@ -59,21 +59,21 @@ PORTFOLIO_QUERY = """SELECT part_id, counterparty_id, full_nm, cash_bal_bank, no
                           cash_in_banks_try, leverage_try, total_assets_try, interestexpense_try,
                           dscrebitda_try, liquid_assets_try, bank_fx_deposit,
                           prev_statement_dt, equity_trend, ebitda_trend
-                   FROM <SEMA>.temp8
+                   FROM {ORACLE_SCHEMA}.temp8
                    ORDER BY NVL(cash_bal_bank, 0) + NVL(noncash_bal_bank, 0) DESC NULLS LAST
                    FETCH FIRST 100 ROWS ONLY"""
 
 # Portföy şirketlerinin ortakları; payı ORTAK_ESIK'ten büyük olanlar haber eşleştirmesine eklenir.
-PARTNER_QUERY = """SELECT company_cust_id, prtnr_cust_id, prtnr_nm, prtnr_prcntg
-                   FROM <SEMA>.company_partners
-                   WHERE company_cust_id IN ({ids})"""
+PARTNER_QUERY = f"""SELECT company_cust_id, prtnr_cust_id, prtnr_nm, prtnr_prcntg
+                   FROM {ORACLE_SCHEMA}.company_partners
+                   WHERE company_cust_id IN ({{ids}})"""
 ORTAK_ESIK = 50.0                # yüzde; tablo pay oranını 0-1 arası tutuyorsa kod bunu fark edip çevirir
 # Bu parçalardan biri geçen ortak tüzel kişi sayılır (yoksa gerçek kişi: yalnızca tam adıyla aranır).
 TUZEL_IPUCU = {"holding", "bv", "nv", "ag", "sa", "spa", "srl", "sarl", "fund", "fonu", "kooperatifi", "vakfi",
                "bankasi", "bank", "group", "grup", "yatirim"}
 
-STRUCTURED_PARQUET_PATH = SCRIPT_DIR / "structured_data.parquet"
-CONFIG_PATH = SCRIPT_DIR / "portfolio_config.py"
+STRUCTURED_PARQUET_PATH = ayarlar.STRUCTURED_PARQUET_PATH
+CONFIG_PATH = ayarlar.PORTFOLIO_CONFIG_PATH
 PREFIX_WORD_COUNTS = (2, 3)      # unvanın ilk 2 ve 3 kelimesi alias olur
 MIN_SINGLE_WORD_LENGTH = 3       # daha kısa ilk kelime aday sayılmaz
 
@@ -97,7 +97,7 @@ TEK_KELIME_YASAK = {"TÜRKİYE", "TÜRK", "AVRUPA", "PETROL", "YAPI", "ASİL", "
 # Unvandan çıkmayan, basının kullandığı adlar. Anahtar counterparty_id; şirket başına tek satır.
 #   "add": eklenecek adlar · "remove": otomatik adlardan çıkarılacaklar · "tickers": borsa kodu (yalnızca büyük harfle)
 # Yanlış eşleşmeyi LLM eler; bu yüzden "remove" ancak bir ad çok sayıda gereksiz soru getiriyorsa kullanılır
-# (4_llm_dogrulama'nın Alias_Onerisi sayfası). Bankadaki gerçek liste paylaşılmadı; aşağıdakiler örnektir.
+# (3_llm_dogrulama'nın Alias_Onerisi sayfası). Bankadaki gerçek liste paylaşılmadı; aşağıdakiler örnektir.
 ALIAS_RULES: Dict[int, dict] = {
     100001: {"add": ["ÖRNEK MARKA"]},               # unvandan çıkmayan, basının kullandığı ad
     100002: {"tickers": ["ABCD"]},                  # borsa kodu
@@ -112,18 +112,49 @@ class CredentialsNotFoundError(RuntimeError):
     """Oracle şifresi tanımlı değil; bağlantı denenmeden durulur."""
 
 
+def _check_temp8_freshness(connection, df: pd.DataFrame) -> None:
+    """temp8 tablosunun ne zaman oluşturulduğunu (LAST_DDL_TIME) ve part_id güncelliğini kontrol edip kullanıcıyı uyarır."""
+    try:
+        ddl_query = """
+        SELECT created, last_ddl_time
+        FROM all_objects
+        WHERE UPPER(owner) = UPPER(:owner) AND UPPER(object_name) = 'TEMP8' AND object_type = 'TABLE'
+        """
+        meta = pd.read_sql(ddl_query, con=connection, params={"owner": ORACLE_SCHEMA})
+        if not meta.empty and pd.notna(meta.iloc[0].get("LAST_DDL_TIME")):
+            ddl_dt = pd.to_datetime(meta.iloc[0]["LAST_DDL_TIME"])
+            age_days = (datetime.now() - ddl_dt).days
+            logger.info("Oracle %s.TEMP8 tablosu son güncelleme tarihi: %s (%d gün önce).",
+                        ORACLE_SCHEMA, ddl_dt.strftime("%Y-%m-%d %H:%M"), age_days)
+            if age_days > ayarlar.STALE_DATA_WARN_DAYS:
+                logger.warning(
+                    "DİKKAT: %s.TEMP8 tablosu %d gün önce oluşturulmuş! SQL Developer'da sorgu.txt çalıştırılmamış olabilir.",
+                    ORACLE_SCHEMA, age_days,
+                )
+    except Exception:
+        pass
+    cols = {c.lower(): c for c in df.columns}
+    if "part_id" in cols and not df.empty:
+        max_part = df[cols["part_id"]].dropna().max()
+        logger.info("Okunan portföydeki en güncel dönem (part_id): %s", max_part)
+
+
 def fetch_data() -> Tuple[pd.DataFrame, pd.DataFrame]:
     """Portföy ve ortaklık sorgularını çalıştırır: (portföy, ortaklar).
 
-    Şifre boşsa bağlanmaz: boş şifreyle denemeler hesabı kilitleyebilir (ORA-28000).
+    Şifre boşsa kullanıcıya sorar; yine boşsa bağlanmaz: boş şifreyle denemeler hesabı kilitleyebilir (ORA-28000).
     """
-    if not ORACLE_PASSWORD:
-        raise CredentialsNotFoundError("ORACLE_PASSWORD boş; 2_sql_to_parquet.py başındaki ayarlarda şifreyi girin.")
+    password = ORACLE_PASSWORD or ayarlar.get_oracle_password(interactive=True)
+    if not password:
+        raise CredentialsNotFoundError("Oracle şifresi girilmedi; ayarlar.py dosyasını kontrol edin veya şifreyi girin.")
+    if "<ORACLE_HOST>" in ORACLE_HOST:
+        raise CredentialsNotFoundError("ayarlar.py içindeki ORACLE_HOST (<ORACLE_HOST>) henüz doldurulmamış.")
     import oracledb
 
     dsn = oracledb.makedsn(ORACLE_HOST, ORACLE_PORT, service_name=ORACLE_SERVICE)
-    with oracledb.connect(user=ORACLE_USER, password=ORACLE_PASSWORD, dsn=dsn) as connection:
+    with oracledb.connect(user=ORACLE_USER, password=password, dsn=dsn) as connection:
         df = pd.read_sql(PORTFOLIO_QUERY, con=connection)
+        _check_temp8_freshness(connection, df)
         ids = ", ".join(str(int(i)) for i in pd.to_numeric(df["COUNTERPARTY_ID" if "COUNTERPARTY_ID" in df else "counterparty_id"],
                                                             errors="coerce").dropna().unique())
         partners = pd.read_sql(PARTNER_QUERY.format(ids=ids), con=connection) if ids else pd.DataFrame()
@@ -291,6 +322,7 @@ def build_companies(df: pd.DataFrame, rules: Optional[Dict[object, dict]] = None
     if "counterparty_id" not in cols or "full_nm" not in cols:
         raise ValueError(f"counterparty_id ve full_nm kolonları gerekli. Kolonlar: {list(df.columns)}")
     ticker_col = next((cols[c] for c in ("bist_ticker", "ticker", "bist_kodu", "hisse_kodu") if c in cols), None)
+    vkn_col = next((cols[c] for c in ("tax_no", "vkn", "vergi_no", "tax_identity_no") if c in cols), None)
 
     companies, candidates = {}, []
     for row in df[df[cols["full_nm"]].notna()].to_dict("records"):
@@ -305,7 +337,12 @@ def build_companies(df: pd.DataFrame, rules: Optional[Dict[object, dict]] = None
         aliases = _unique([a for a in aliases if normalize_text(a) not in removed] + _texts(rule, "add"))
         ticker = str(row[ticker_col]).strip().upper() if ticker_col and pd.notna(row[ticker_col]) else ""
         tickers = list(dict.fromkeys(t.upper() for t in [ticker] + _texts(rule, "tickers") if t))
-        companies[key] = {"name": name, "aliases": aliases, "tickers": tickers}
+        entry = {"name": name, "aliases": aliases, "tickers": tickers}
+        if vkn_col and pd.notna(row.get(vkn_col)):
+            vkn_raw = re.sub(r"\D", "", str(row[vkn_col]).split(".")[0])
+            if vkn_raw:
+                entry["vkn"] = vkn_raw.zfill(10) if len(vkn_raw) <= 10 else vkn_raw
+        companies[key] = entry
         own = {normalize_text(a) for a in aliases}
         for o in owners_of.get(key, []):
             o_aliases = [a for a in partner_aliases(o["name"]) if normalize_text(a) not in own]
