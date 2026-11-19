@@ -372,6 +372,21 @@ kırmızı bayrakları.
 6. **Kod içi eski yorumlar:** `ews_olay.py`'deki `STAGE2_ESIK` yorumu ("haber ve finansal skor için aynı") ve
    `ews_defter.py`'deki "Bantlar finansal skorla aynı eşiklerden gelir" yorumu 11 Kasım'dan beri yanlış.
 7. **Değerlendirme yok.** LLM isabeti yalnızca Kontrol notlarıyla ölçülebiliyor ve notlar henüz birikmedi.
+8. **Portföy tablosunu (temp8) üreten SQL'in bulguları (19 Kas).** SQL bu depoda yok, bankadadır.
+   - **Bilançosu olmayan müşteriler portföyden düşüyor.** Müşteri listesine bilançolar LEFT JOIN ile bağlanıyor,
+     ama ardından gelen `WHERE equity IS NOT NULL ... AND total_debt >= 0` join'i fiilen INNER JOIN yapıyor.
+     Bilançosu olmayan ya da bu alanları boş gelen müşteri temp8'e girmiyor, bu yüzden haberleri de taranmıyor.
+     **Yönetici kararı: kabul edildi**, bilançosu olmayan müşteri önemli değil.
+   - **`statement_dt` tipi doğrulanmadı.** Sütun `DD/MM/YYYY` metniyse `>= '31/12/2019'` metin karşılaştırması
+     olur ve yalnızca 31/12 bilançolarını bırakır. Mali yılı aralık dışında kapanan şirketler bilançoları olduğu
+     hâlde elenir, yukarıdaki kural yüzünden de portföyden düşer. Yanlış bilançonun "en güncel" seçilmesi ise
+     olmaz: filtreden sonra yalnızca 31/12 kalıyor ve `max` yılı doğru karşılaştırıyor. Tip DATE ise sorun yok.
+   - **`nvl(kur, 1)`:** kur bulunamayan döviz bilanço sessizce TL sayılıyor. Olası tetikleyici: hafta sonuna
+     denk gelen 31/12'ler.
+   - **Döviz alt toplamlarında temerrüt filtresi eksik.** TL ve YP bakiye alt sorgularında temerrüt filtresi
+     yok, oysa toplam bakiye sorgusunda var. Takipteki döviz kredisi döviz kapsaması hesabına giriyor.
+   - **Henüz doğrulanmadı:** yuvarlama birimi (`ROUNDING`) kullanılmıyor; döviz mevduatının birimi teyit
+     edilmedi.
 
 ### İncelemeciden özellikle istenenler
 - `ews_defter.build_ledger` ve `_link`: defter mantığında başka kenar durumları (aynı gün açılış/kapanış, yanlış
