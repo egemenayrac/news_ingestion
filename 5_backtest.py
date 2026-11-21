@@ -159,12 +159,18 @@ def run_snapshot_as_of(as_of_date: str, llm: LLMClient, cache: Cache, fin_df: pd
     df = ews_defter.annotate(df, ledgers)
     companies = ews_tablolar.build_company_table(df, ledgers, bugun=as_of_date)
 
-    # Finansal tabloda gelecekten bilgi sızmasını (look-ahead bias) önle: yalnızca statement_dt <= as_of_date olanlar
+    # Finansal tabloda gelecekten bilgi sızmasını (look-ahead bias) önle:
+    # yalnızca statement_dt <= as_of_date olanları al ve şirket başına en güncel bilançoyu seç
     as_of_ts = pd.Timestamp(as_of_date)
     fin_valid = fin_df
     if not fin_df.empty and "Finansal_Tarih" in fin_df.columns:
         f_dates = pd.to_datetime(fin_df["Finansal_Tarih"], errors="coerce")
-        fin_valid = fin_df[f_dates.isna() | (f_dates <= as_of_ts)].copy()
+        mask = f_dates.isna() | (f_dates <= as_of_ts)
+        fin_valid = (fin_df.loc[mask]
+                     .assign(_fdt=f_dates.loc[mask])
+                     .sort_values("_fdt", na_position="first", kind="stable")
+                     .drop_duplicates("Şirket", keep="last")
+                     .drop(columns=["_fdt"]))
 
     combined = ews_portfoy.build_combined_table(df, companies, fin_valid, zayif_dscr=zayif_dscr)
     combined.insert(0, "As_Of_Tarih", as_of_date)

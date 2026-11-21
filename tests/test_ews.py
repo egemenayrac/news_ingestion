@@ -83,6 +83,55 @@ def test_backtest_evaluate_static_vs_historical_financials_and_sinirlar():
     assert m_hist.loc["Yalnızca Finansal Skor (3 Katmanlı)", "Medyan_Kursun_Suresi_Gun"] == 61.0
 
 
+def test_run_snapshot_as_of_selects_latest_historical_statement_per_company(tmp_path):
+    bt = importlib.import_module("5_backtest")
+    cache = ews_llm.Cache(tmp_path / "cache.jsonl")
+    llm = ews_llm.LLMClient(url="https://<SUNUCU>/v1/chat/completions")
+
+    # Aynı şirket için iki farklı bilanço dönemi: 2024 (sağlam/Stage 1) ve 2025 (zayıf/Stage 2)
+    prematched = pd.DataFrame([
+        {
+            "Tarih": "2025-05-15", "Kaynak": "Test", "Başlık": "ABC A.Ş. rutin açıklama",
+            "URL": "http://ex/n1", "Metin": "ABC A.Ş. olağan genel kurul yaptı.",
+            "Şirket": 101, "Şirket_Adi": "ABC A.Ş.", "Eşleşen_Alias": "ABC",
+            "Ortak": None, "Metin_Snippet": "ABC A.Ş. olağan genel kurul yaptı.",
+            "_Anahtar": "URL::ex/n1|101|5",
+        },
+        {
+            "Tarih": "2026-05-15", "Kaynak": "Test", "Başlık": "ABC A.Ş. yeni açıklama",
+            "URL": "http://ex/n2", "Metin": "ABC A.Ş. yönetim kurulu toplandı.",
+            "Şirket": 101, "Şirket_Adi": "ABC A.Ş.", "Eşleşen_Alias": "ABC",
+            "Ortak": None, "Metin_Snippet": "ABC A.Ş. yönetim kurulu toplandı.",
+            "_Anahtar": "URL::ex/n2|101|5",
+        },
+    ])
+    cache.put("URL::ex/n1|101|5", {"alaka": "alakasiz", "alaka_gerekce": "rutin"})
+    cache.put("URL::ex/n2|101|5", {"alaka": "alakasiz", "alaka_gerekce": "rutin"})
+
+    hist_fin = pd.DataFrame([
+        {
+            "Şirket": 101, "Finansal_Unvan": "ABC A.Ş.", "Finansal_Tarih": "2024-12-31",
+            "Finansal_Skor": 20.0, "Finansal_Veri_Kapsami": 1.0, "DSCR_Degeri": 2.5,
+            "Toplam_Bakiye_TRY": 100_000_000.0,
+        },
+        {
+            "Şirket": 101, "Finansal_Unvan": "ABC A.Ş.", "Finansal_Tarih": "2025-12-31",
+            "Finansal_Skor": 65.0, "Finansal_Veri_Kapsami": 1.0, "DSCR_Degeri": 0.9,
+            "Toplam_Bakiye_TRY": 100_000_000.0,
+        },
+    ])
+
+    snap_2025 = bt.run_snapshot_as_of("2025-06-30", llm, cache, hist_fin, workers=1, prematched_df=prematched)
+    assert len(snap_2025) == 1
+    assert snap_2025.iloc[0]["Finansal_Tarih"] == "2024-12-31"
+    assert snap_2025.iloc[0]["Finansal_Seviye"] == ews_olay.STAGE_LABEL[1]
+
+    snap_2026 = bt.run_snapshot_as_of("2026-06-30", llm, cache, hist_fin, workers=1, prematched_df=prematched)
+    assert len(snap_2026) == 1
+    assert snap_2026.iloc[0]["Finansal_Tarih"] == "2025-12-31"
+    assert snap_2026.iloc[0]["Finansal_Seviye"] == ews_olay.STAGE_LABEL[2]
+
+
 def test_build_themes_strict_stems_similarity_cache_and_nan_guard(tmp_path):
     cache = ews_llm.Cache(tmp_path / "cache.jsonl")
     calls = {"ask": 0, "sim": 0}
