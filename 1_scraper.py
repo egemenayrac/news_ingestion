@@ -77,17 +77,34 @@ class HybridSession(requests.Session):
             kwargs['verify'] = False if self.custom_proxy_url else True
         return super().request(method, url, **kwargs)
 
-def create_configured_session() -> HybridSession:
-    proxy_url = ayarlar.get_proxy_url(interactive=True)
-    return HybridSession(proxy_url=proxy_url, bypass_domains=ayarlar.PROXY_BYPASS_DOMAINS)
+import threading
 
-_SESSION: HybridSession | None = None
+_PROXY_LOCK = threading.Lock()
+_PROXY_RESOLVED = False
+_PROXY_URL: str | None = None
+_THREAD_LOCAL = threading.local()
+
+
+def _resolve_proxy_once() -> str | None:
+    global _PROXY_RESOLVED, _PROXY_URL
+    if not _PROXY_RESOLVED:
+        with _PROXY_LOCK:
+            if not _PROXY_RESOLVED:
+                _PROXY_URL = ayarlar.get_proxy_url(interactive=True)
+                _PROXY_RESOLVED = True
+    return _PROXY_URL
+
+
+def create_configured_session() -> HybridSession:
+    return HybridSession(proxy_url=_resolve_proxy_once(), bypass_domains=ayarlar.PROXY_BYPASS_DOMAINS)
+
 
 def get_session() -> HybridSession:
-    global _SESSION
-    if _SESSION is None:
-        _SESSION = create_configured_session()
-    return _SESSION
+    sess = getattr(_THREAD_LOCAL, "session", None)
+    if sess is None:
+        sess = create_configured_session()
+        _THREAD_LOCAL.session = sess
+    return sess
 
 # =============================================================================
 # 3. YARDIMCI VERİ VE KAP DECODER METOTLARI

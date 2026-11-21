@@ -44,7 +44,7 @@ def test_backtest_find_candidate_outcome_tables_dwh_schema(tmp_path):
     assert "STAGE_CODE" in df.iloc[0]["ilgili_kolonlar"]
 
 
-def test_backtest_evaluate_computes_financial_lead_time():
+def test_backtest_evaluate_static_vs_historical_financials_and_sinirlar():
     bt = importlib.import_module("5_backtest")
     snaps = pd.DataFrame([
         {
@@ -64,10 +64,23 @@ def test_backtest_evaluate_computes_financial_lead_time():
     ])
     outcomes = pd.DataFrame([{"counterparty_id": 101, "outcome_dt": "2026-10-31", "outcome_type": "Stage 2"}])
 
-    res = bt.evaluate_backtest(snaps, outcomes)
-    metrics = res["Ozet_Metrikler"].set_index("Model_Katmani")
-    assert metrics.loc["Yalnızca Finansal Skor (3 Katmanlı)", "Medyan_Kursun_Suresi_Gun"] == 61.0
-    assert metrics.loc["Yalnızca Haber Sinyali (Olay Defteri)", "Medyan_Kursun_Suresi_Gun"] == 31.0
+    # Tek anlık bilanço -> Finansal kurşun süresi None ve Sinirlar sayfası uyarılı
+    static_fin = pd.DataFrame([{"Şirket": 101, "Finansal_Tarih": "2025-12-31"}])
+    res_static = bt.evaluate_backtest(snaps, outcomes, fin_df=static_fin, news_span_days=105)
+    m_static = res_static["Ozet_Metrikler"].set_index("Model_Katmani")
+    assert pd.isna(m_static.loc["Yalnızca Finansal Skor (3 Katmanlı)", "Medyan_Kursun_Suresi_Gun"])
+    assert m_static.loc["Yalnızca Haber Sinyali (Olay Defteri)", "Medyan_Kursun_Suresi_Gun"] == 31.0
+    assert "Sinirlar" in res_static and len(res_static["Sinirlar"]) >= 4
+    assert "TEK ANLIK GÖRÜNTÜ" in set(res_static["Sinirlar"]["Durum"])
+
+    # Çok dönemli tarihsel finansal seri -> Finansal kurşun süresi hesaplanır
+    hist_fin = pd.DataFrame([
+        {"Şirket": 101, "Finansal_Tarih": "2024-12-31"},
+        {"Şirket": 101, "Finansal_Tarih": "2025-12-31"},
+    ])
+    res_hist = bt.evaluate_backtest(snaps, outcomes, fin_df=hist_fin, news_span_days=200)
+    m_hist = res_hist["Ozet_Metrikler"].set_index("Model_Katmani")
+    assert m_hist.loc["Yalnızca Finansal Skor (3 Katmanlı)", "Medyan_Kursun_Suresi_Gun"] == 61.0
 
 
 def test_build_themes_strict_stems_similarity_cache_and_nan_guard(tmp_path):
@@ -147,8 +160,19 @@ def test_scraper_fails_fast_on_404(monkeypatch):
     assert attempts["n"] == 2
 
 
-def test_llm_client_uses_persistent_session(monkeypatch):
+def test_llm_client_uses_thread_local_session(monkeypatch):
+    import threading
+
     client = ews_llm.LLMClient(url="https://example.local/v1/chat/completions", key="Bearer test-key")
+    s_main = client._get_session()
+    assert s_main is client._get_session()
+
+    other_ids = []
+    t = threading.Thread(target=lambda: other_ids.append(id(client._get_session())))
+    t.start()
+    t.join()
+    assert other_ids[0] != id(s_main)
+
     called = {"session_post": 0}
 
     class FakeResp:
@@ -163,7 +187,7 @@ def test_llm_client_uses_persistent_session(monkeypatch):
         assert kwargs["headers"]["Authorization"] == "Bearer test-key"
         return FakeResp()
 
-    monkeypatch.setattr(client._session, "post", fake_post)
+    monkeypatch.setattr(s_main, "post", fake_post)
     obj, status = client.ask("sys", "usr")
     assert status == "ok"
     assert obj == {"alaka": "odak"}

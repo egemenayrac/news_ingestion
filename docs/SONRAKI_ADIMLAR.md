@@ -64,7 +64,7 @@ Son güncelleme: 2 Kasım 2026. Liste, 26 Ekim'deki sistem incelemesinden çıkt
 | Kaynak sağlık uyarısı | Scraper hataları sessizce yutuyor (`except: pass`). 10 günden uzun bir kesinti kalıcı boşluk bırakıyor. Dashboard'a kaynak × gün haber sayısı eklenmeli | küçük-orta |
 | "Sinyal yok" etiketi | Haberi olmayan şirket "Düşük Risk" görünüyor | küçük |
 | Kritik olayda ikinci soru ("olayın öznesi kim?") | Stage 3 tek bir LLM cevabına dayanıyor. Borsadaki "temerrüt satışı" haberinin bir şirkete Stage 3 vermesi bu türden bir hataydı | küçük |
-| `yalanlandi_cozuldu`'nun ikiye bölünmesi | Öncesinde haberi olmayan bir şirket için tek başına gelen yalanlama hâlâ Stage 2 veriyor. Bir sonraki prompt değişikliğiyle birlikte yapılmalı | küçük |
+| `yalanlandi_cozuldu`'nun ikiye bölünmesi (`yalanlandi` / `cozuldu`) | `tekil_kapanis` kuralı sahte yalanlamaları susturuyor ama açılış haberi 180 gün dışındaki gerçek bir konkordato/haciz çözümünü de Stage 1'e indiriyor. `PROMPT_SURUMU` artacağı için bir sonraki prompt geçişiyle birlikte `yalanlandi` (Stage 1) ve `cozuldu` (bir kademe düşük) olarak ayrılmalı | küçük |
 | Kalıcı olay deposu | Konkordato 180 gün haber çıkmazsa defterden düşüyor, oysa süreç bir yılı aşabiliyor | orta |
 | Token ve süre logu, bağlam sınırının ölçülmesi | Tema sorusu sunucunun bağlam sınırını aşarsa Temalar sayfası uyarı vermeden boş gelir | küçük |
 | Dosya yolu kontrolü | Scraper `F:\...` altına yazıyor, eşleştirme `G:\...` altından okuyor | 5 dk |

@@ -171,11 +171,64 @@ def run_snapshot_as_of(as_of_date: str, llm: LLMClient, cache: Cache, fin_df: pd
     return combined
 
 
+def _has_historical_financials(fin_df: Optional[pd.DataFrame]) -> bool:
+    """Finansal tabloda şirket başına birden fazla tarihsel dönem (statement_dt) var mı?"""
+    if fin_df is None or fin_df.empty or "Şirket" not in fin_df.columns or "Finansal_Tarih" not in fin_df.columns:
+        return False
+    valid = fin_df.dropna(subset=["Şirket", "Finansal_Tarih"])
+    if valid.empty:
+        return False
+    return bool((valid.groupby("Şirket")["Finansal_Tarih"].nunique() > 1).any())
+
+
+def build_limitations_table(snapshots: pd.DataFrame, fin_df: Optional[pd.DataFrame],
+                            outcomes: Optional[pd.DataFrame], news_span_days: Optional[int] = None) -> pd.DataFrame:
+    """backtest_raporu.xlsx içine eklenecek metodoloji sınırları ve yorumlama notları sayfası."""
+    has_hist_fin = _has_historical_financials(fin_df)
+    has_outcomes = outcomes is not None and not outcomes.empty
+    n_periods = int(snapshots["As_Of_Tarih"].nunique()) if not snapshots.empty and "As_Of_Tarih" in snapshots.columns else 0
+    if news_span_days is not None:
+        arsiv_notu = (f"Haber arşivi {news_span_days} günlük dönemi kapsıyor "
+                      + (f"(erken uyarı penceresi {LEAD_WINDOW_DAYS} günden kısa; ilk aylarda eksik pencere etkisi vardır)."
+                         if news_span_days < LEAD_WINDOW_DAYS else f"(erken uyarı penceresi: {LEAD_WINDOW_DAYS} gün)."))
+    else:
+        arsiv_notu = f"Test {n_periods} as_of dönemi üzerinden çalıştırıldı (erken uyarı penceresi: {LEAD_WINDOW_DAYS} gün)."
+
+    rows = [
+        {
+            "Sinir_Alani": "Hayatta Kalma Yanlılığı (Survivorship Bias)",
+            "Durum": "UYARI",
+            "Aciklama": "Portföy yalnızca bugün aktif (performing) olan en büyük 100 müşteriden oluşuyorsa geçmişte batmış/takibe düşmüş şirketler testte yer almaz; yakalama oranı (Recall) gerçek performansı temsil etmez.",
+        },
+        {
+            "Sinir_Alani": "Finansal Veri Yapısı",
+            "Durum": "TARİHSEL" if has_hist_fin else "TEK ANLIK GÖRÜNTÜ",
+            "Aciklama": ("Şirket başına birden fazla tarihsel bilanço dönemi tespit edildi." if has_hist_fin else
+                         "Finansal veriler tek bir güncel bilançodan oluşuyor (tarihsel seri ve yayın gecikmesi yok). Finansal kurşun süresi bu yüzden boş (None) bırakılmıştır; Birleşik kurşun süresi de finansal tetiklenen şirketlerde sabit bilanço etkisi taşır."),
+        },
+        {
+            "Sinir_Alani": "Haber Arşivi Kapsamı",
+            "Durum": "KISA ARŞİV" if (news_span_days is not None and news_span_days < LEAD_WINDOW_DAYS) else "BİLGİ",
+            "Aciklama": arsiv_notu,
+        },
+        {
+            "Sinir_Alani": "Raporun Kullanım Amacı",
+            "Durum": "SİNYAL DAĞILIMI" if (not has_outcomes or not has_hist_fin) else "BACKTEST",
+            "Aciklama": ("Gerçekleşen olay tablosu (outcomes) veya tarihsel portföy/bilanço serisi tamamlanana kadar bu çıktı yalnızca dönemsel sinyal dağılımı raporu olarak yorumlanmalıdır."
+                         if (not has_outcomes or not has_hist_fin) else
+                         "Gerçekleşen olay tablosu ve tarihsel finansal seriyle karşılaştırma yapılmıştır."),
+        },
+    ]
+    return pd.DataFrame(rows)
+
+
 # =============================================================================
 # 4. Gerçekleşen Kredi Olaylarıyla Karşılaştırma ve Kurşun Süresi (Lead Time)
 # =============================================================================
 def evaluate_backtest(snapshots: pd.DataFrame, outcomes: pd.DataFrame,
-                      lead_window_days: int = LEAD_WINDOW_DAYS) -> Dict[str, pd.DataFrame]:
+                      lead_window_days: int = LEAD_WINDOW_DAYS,
+                      fin_df: Optional[pd.DataFrame] = None,
+                      news_span_days: Optional[int] = None) -> Dict[str, pd.DataFrame]:
     """Aylık/dönemlik EWS çıktıları (`snapshots`) ile bankadaki gerçekleşen olayları (`outcomes`) karşılaştırır.
 
     outcomes zorunlu kolonlar:
@@ -183,9 +236,12 @@ def evaluate_backtest(snapshots: pd.DataFrame, outcomes: pd.DataFrame,
       - outcome_dt (veya Olay_Tarihi): bankada Stage 2/3, izleme ya da yapılandırma tarihi
       - outcome_type (isteğe bağlı): olay türü ("Stage 2 geçişi", "Yapılandırma", "NPL" vb.)
     """
+    sinirlar = build_limitations_table(snapshots, fin_df, outcomes, news_span_days=news_span_days)
     if snapshots.empty:
-        return {"Ozet_Metrikler": pd.DataFrame(), "Olay_Bazli_Analiz": pd.DataFrame(), "Tum_Donemler": snapshots}
+        return {"Ozet_Metrikler": pd.DataFrame(), "Olay_Bazli_Analiz": pd.DataFrame(),
+                "Tum_Donemler": snapshots, "Sinirlar": sinirlar}
 
+    has_hist_fin = _has_historical_financials(fin_df)
     snap = snapshots.copy()
     snap["As_Of_DT"] = pd.to_datetime(snap["As_Of_Tarih"], errors="coerce")
     snap["Haber_Stage"] = snap["Haber_Sinyali"].map(ews_olay.STAGE_NO).fillna(1).astype(int)
@@ -200,7 +256,8 @@ def evaluate_backtest(snapshots: pd.DataFrame, outcomes: pd.DataFrame,
                      Haber_Stage3=("Haber_Stage", lambda s: int((s == 3).sum())),
                      Finansal_Stage2_Ustu=("Fin_Stage", lambda s: int((s >= 2).sum())),
                      Birlesik_Stage2_Ustu=("Birlesik_Stage", lambda s: int((s >= 2).sum()))))
-        return {"Ozet_Metrikler": ozet, "Olay_Bazli_Analiz": pd.DataFrame(), "Tum_Donemler": snap}
+        return {"Ozet_Metrikler": ozet, "Olay_Bazli_Analiz": pd.DataFrame(),
+                "Tum_Donemler": snap.drop(columns=["As_Of_DT"]), "Sinirlar": sinirlar}
 
     cols = {c.lower(): c for c in outcomes.columns}
     id_col = cols.get("counterparty_id") or cols.get("şirket") or cols.get("sirket")
@@ -227,7 +284,7 @@ def evaluate_backtest(snapshots: pd.DataFrame, outcomes: pd.DataFrame,
         comb_hits = prior[prior["Birlesik_Stage"] >= 2]
 
         first_haber_dt = haber_hits["As_Of_DT"].iloc[0] if len(haber_hits) else pd.NaT
-        first_fin_dt = fin_hits["As_Of_DT"].iloc[0] if len(fin_hits) else pd.NaT
+        first_fin_dt = fin_hits["As_Of_DT"].iloc[0] if (has_hist_fin and len(fin_hits)) else pd.NaT
         first_comb_dt = comb_hits["As_Of_DT"].iloc[0] if len(comb_hits) else pd.NaT
 
         event_rows.append({
@@ -261,14 +318,17 @@ def evaluate_backtest(snapshots: pd.DataFrame, outcomes: pd.DataFrame,
             "Yakalama_Orani_Yuzde": round(100 * ev_table["Haber_Yakaladi"].mean(), 1) if n_events else 0.0,
             "Medyan_Kursun_Suresi_Gun": float(ev_table["Haber_Kursun_Suresi_Gun"].median()) if n_events and ev_table["Haber_Kursun_Suresi_Gun"].notna().any() else None,
             "Yanlis_Alarm_100_Sirket_Ay": round(100 * (clean_snaps["Haber_Stage"] >= 2).sum() / n_clean, 1),
+            "Not": "",
         },
         {
             "Model_Katmani": "Yalnızca Finansal Skor (3 Katmanlı)",
             "Toplam_Kredi_Olayi": n_events,
             "Yakalanan_Olay": int(ev_table["Finansal_Yakaladi"].sum()) if n_events else 0,
             "Yakalama_Orani_Yuzde": round(100 * ev_table["Finansal_Yakaladi"].mean(), 1) if n_events else 0.0,
-            "Medyan_Kursun_Suresi_Gun": float(ev_table["Finansal_Kursun_Suresi_Gun"].median()) if n_events and ev_table["Finansal_Kursun_Suresi_Gun"].notna().any() else None,
+            "Medyan_Kursun_Suresi_Gun": (float(ev_table["Finansal_Kursun_Suresi_Gun"].median())
+                                         if has_hist_fin and n_events and ev_table["Finansal_Kursun_Suresi_Gun"].notna().any() else None),
             "Yanlis_Alarm_100_Sirket_Ay": round(100 * (clean_snaps["Fin_Stage"] >= 2).sum() / n_clean, 1),
+            "Not": "" if has_hist_fin else "Finansal veri tarihsel değil (tek bilanço); kurşun süresi hesaplanmadı",
         },
         {
             "Model_Katmani": "Birleşik EWS (Haber + Finansal)",
@@ -277,9 +337,11 @@ def evaluate_backtest(snapshots: pd.DataFrame, outcomes: pd.DataFrame,
             "Yakalama_Orani_Yuzde": round(100 * ev_table["Birlesik_Yakaladi"].mean(), 1) if n_events else 0.0,
             "Medyan_Kursun_Suresi_Gun": float(ev_table["Birlesik_Kursun_Suresi_Gun"].median()) if n_events and ev_table["Birlesik_Kursun_Suresi_Gun"].notna().any() else None,
             "Yanlis_Alarm_100_Sirket_Ay": round(100 * (clean_snaps["Birlesik_Stage"] >= 2).sum() / n_clean, 1),
+            "Not": "" if has_hist_fin else "Finansal katman tek bilanço (bkz. Sinirlar sayfası)",
         },
     ])
-    return {"Ozet_Metrikler": metrics, "Olay_Bazli_Analiz": ev_table, "Tum_Donemler": snap.drop(columns=["As_Of_DT"])}
+    return {"Ozet_Metrikler": metrics, "Olay_Bazli_Analiz": ev_table,
+            "Tum_Donemler": snap.drop(columns=["As_Of_DT"]), "Sinirlar": sinirlar}
 
 
 def _month_ends(start_dt: pd.Timestamp, end_dt: pd.Timestamp) -> pd.DatetimeIndex:
@@ -300,6 +362,7 @@ def run_backtest(as_of_dates: Optional[List[str]] = None) -> Dict[str, pd.DataFr
                     retries=cfg.LLM_RETRIES, max_tokens=cfg.LLM_MAX_TOKENS)
     cache = Cache(CACHE_PATH)
     fin_df = ews_portfoy.load_financials()
+    news_span_days: Optional[int] = None
 
     if not as_of_dates:
         if not Path(eslestirme.PARQUET_PATH).exists():
@@ -309,6 +372,7 @@ def run_backtest(as_of_dates: Optional[List[str]] = None) -> Dict[str, pd.DataFr
         dates = eslestirme.to_naive_datetime(news_df["Tarih"]).dropna()
         if dates.empty:
             return {}
+        news_span_days = int((dates.max().normalize() - dates.min().normalize()).days) + 1
         # Arşivdeki her ayın son günü + en son haber günü
         month_ends = _month_ends(dates.min().normalize(), dates.max().normalize())
         as_of_dates = sorted({d.strftime("%Y-%m-%d") for d in month_ends} | {dates.max().strftime("%Y-%m-%d")})
@@ -334,7 +398,7 @@ def run_backtest(as_of_dates: Optional[List[str]] = None) -> Dict[str, pd.DataFr
 
     all_snaps = pd.concat(snaps, ignore_index=True) if snaps else pd.DataFrame()
     outcomes = pd.read_csv(OUTCOMES_PATH) if OUTCOMES_PATH.exists() else pd.DataFrame()
-    results = evaluate_backtest(all_snaps, outcomes)
+    results = evaluate_backtest(all_snaps, outcomes, fin_df=fin_df, news_span_days=news_span_days)
 
     cand_tables = find_candidate_outcome_tables()
     if not cand_tables.empty:
