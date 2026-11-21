@@ -293,3 +293,73 @@ def test_write_excel_cleans_strings_only(tmp_path):
     assert list(back.columns) == ["Ad", "Tutar"]
     assert back.iloc[0]["Ad"] == "AB"
     assert back.iloc[0]["Tutar"] == 123.45
+
+
+def test_ilan_gov_tr_api_and_vkn_extraction(monkeypatch):
+    from datetime import datetime, timezone
+
+    mod = importlib.import_module("4_resmi_ilanlar")
+    monkeypatch.setattr(mod.time, "sleep", lambda _s: None)
+
+    # Hem önekli (VKN: ...) hem mahkeme üslubu (... vergi numaralı) VKN çıkarımı
+    tag = mod.extract_identifiers(
+        "Bursa Ticaret Sicil'de kayıtlı 3851381252 vergi numaralı FEY A.Ş. ve VKN: 1234567890 borçlu."
+    )
+    assert "3851381252" in tag
+    assert "1234567890" in tag
+
+    today_tr = datetime.now(timezone.utc).strftime("%d.%m.%Y")
+    seen_posts = []
+    seen_gets = []
+
+    class FakeResp:
+        def __init__(self, status_code, body):
+            self.status_code = status_code
+            self._body = body
+
+        def json(self):
+            return self._body
+
+    class FakeSession:
+        def post(self, url, json=None, headers=None, timeout=None, verify=None):
+            seen_posts.append((url, json, headers))
+            return FakeResp(200, {
+                "success": True,
+                "result": {
+                    "numFound": 1,
+                    "ads": [{
+                        "id": 2291587,
+                        "adNo": "ILN02597022",
+                        "title": "Konkordato mühlet kararının ilanen tebliği",
+                        "advertiserName": "BURSA 2. ASLİYE TİCARET MAHKEMESİ",
+                        "publishStartDate": today_tr,
+                        "urlStr": "/ilan/2291587/konkordato-muhlet-karari",
+                    }],
+                },
+            })
+
+        def get(self, url, params=None, headers=None, timeout=None, verify=None):
+            seen_gets.append((url, params, headers))
+            return FakeResp(200, {
+                "success": True,
+                "result": {
+                    "id": 2291587,
+                    "content": (
+                        "<p>3851381252 vergi numaralı FEY KONFEKSİYON A.Ş. hakkında üç ay süre ile "
+                        "GEÇİCİ MÜHLET kararı verilmesine ve konkordato komiseri atanmasına karar verildi.</p>"
+                    ),
+                },
+            })
+
+    rows = mod.fetch_ilan_gov_tr(FakeSession(), existing_urls=set(), days=10, max_pages=1)
+    assert len(rows) == 1  # 4 arama teriminde aynı ilan tekilleştirilmeli
+    assert len(seen_gets) == 1
+    assert seen_posts[0][0] == mod.ILAN_GOV_SEARCH_API
+    assert seen_posts[0][1]["keys"]["ats"] == [mod.ILAN_GOV_AD_TYPE_TEBLIGAT]
+    assert seen_posts[0][2]["x-request-origin"] == "IGT-UI"
+    assert seen_gets[0][0] == mod.ILAN_GOV_DETAIL_API
+    assert seen_gets[0][1] == {"id": "2291587"}
+    assert "[VKN: 3851381252]" in rows[0]["Başlık"]
+    assert rows[0]["URL"] == "https://www.ilan.gov.tr/ilan/2291587/konkordato-muhlet-karari"
+    assert "GEÇİCİ MÜHLET" in rows[0]["Metin"]
+

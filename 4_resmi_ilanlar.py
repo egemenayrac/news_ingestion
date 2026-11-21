@@ -46,8 +46,18 @@ LOOKBACK_DAYS = ayarlar.LOOKBACK_DAYS
 
 # Resmi Gazete ve İlan.gov.tr uç noktaları
 RESMI_GAZETE_BASE = "https://www.resmigazete.gov.tr"
-ILAN_GOV_SEARCH_API = "https://www.ilan.gov.tr/api/api/services/app/Ad/GetAdsByFilter"
-ILAN_GOV_DETAIL_BASE = "https://www.ilan.gov.tr/ilan/"
+ILAN_GOV_BASE = "https://www.ilan.gov.tr"
+ILAN_GOV_SEARCH_API = f"{ILAN_GOV_BASE}/api/api/services/app/Ad/AdsByFilter"
+ILAN_GOV_DETAIL_API = f"{ILAN_GOV_BASE}/api/api/services/app/AdDetail/GetAdDetail"
+ILAN_GOV_AD_TYPE_TEBLIGAT = 4  # 2=İcra, 3=İhale, 4=Tebligat (Konkordato ve İflas Hukuku Davaları dahil), 5=Personel
+ILAN_GOV_HEADERS = {
+    "accept": "text/plain, application/json",
+    "content-type": "application/json-patch+json",
+    "origin": ILAN_GOV_BASE,
+    "referer": f"{ILAN_GOV_BASE}/ilan/tum-ilanlar",
+    "x-request-origin": "IGT-UI",
+    "x-requested-with": "XMLHttpRequest",
+}
 
 # Resmi ilanlarda aranan risk anahtar kelimeleri
 RISK_KEYWORDS_RE = re.compile(
@@ -55,8 +65,14 @@ RISK_KEYWORDS_RE = re.compile(
     r"ihale(?:lere)?\s+katılmaktan\s+yasaklama|kayy[ıu]m|mal\s*varlığına\s+tedbir)\b",
     flags=re.IGNORECASE | re.UNICODE,
 )
-VKN_RE = re.compile(r"\b(?:VKN|Vergi\s*(?:Kimlik)?\s*No|Vergi\s*Numarası)\s*[:.]?\s*(\d{10})\b", re.IGNORECASE)
-MERSIS_RE = re.compile(r"\b(?:MERSİS|Mersis)\s*(?:No|Numarası)?\s*[:.]?\s*(\d{16})\b", re.IGNORECASE)
+VKN_PATTERNS = (
+    re.compile(r"\b(?:VKN|Vergi\s*(?:Kimlik)?\s*No|Vergi\s*Numaras[ıi])\s*[:.]?\s*(\d{10})\b", re.IGNORECASE),
+    re.compile(r"\b(\d{10})\s*(?:vergi\s*(?:kimlik\s*)?numaral[ıi]|vergi\s*(?:kimlik\s*)?no['’]?lu|VKN['’]?li)\b", re.IGNORECASE),
+)
+MERSIS_PATTERNS = (
+    re.compile(r"\b(?:MERS[İI]S|Mersis)\s*(?:No|Numaras[ıi])?\s*[:.]?\s*(\d{16})\b", re.IGNORECASE),
+    re.compile(r"\b(\d{16})\s*(?:MERS[İI]S|Mersis)\s*(?:numaral[ıi]|no['’]?lu)?\b", re.IGNORECASE),
+)
 
 
 # =============================================================================
@@ -65,7 +81,7 @@ MERSIS_RE = re.compile(r"\b(?:MERSİS|Mersis)\s*(?:No|Numarası)?\s*[:.]?\s*(\d{
 def create_session() -> requests.Session:
     session = requests.Session()
     session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/122.0.0.0 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36",
         "Accept-Language": "tr-TR,tr;q=0.9,en-US;q=0.8",
     })
     proxy_url = ayarlar.get_proxy_url(interactive=True)
@@ -77,8 +93,9 @@ def create_session() -> requests.Session:
 
 def extract_identifiers(text: str) -> str:
     """Metinde geçen VKN (10 hane) ve MERSİS (16 hane) numaralarını özet etiketi olarak çıkarır."""
-    vkns = sorted(set(VKN_RE.findall(text or "")))
-    mersis = sorted(set(MERSIS_RE.findall(text or "")))
+    raw = text or ""
+    vkns = sorted({m for pat in VKN_PATTERNS for m in pat.findall(raw)})
+    mersis = sorted({m for pat in MERSIS_PATTERNS for m in pat.findall(raw)})
     parts = []
     if vkns:
         parts.append(f"VKN: {', '.join(vkns)}")
@@ -87,76 +104,120 @@ def extract_identifiers(text: str) -> str:
     return f" [{'; '.join(parts)}]" if parts else ""
 
 
+def _parse_ilan_date(raw: object) -> Optional[datetime]:
+    """İlan.gov.tr tarih biçimlerini (ISO veya DD.MM.YYYY) UTC datetime'a çevirir."""
+    s = str(raw or "").strip()
+    if not s:
+        return None
+    for fmt in ("%Y-%m-%d", "%d.%m.%Y", "%d/%m/%Y"):
+        try:
+            return datetime.strptime(s[:10], fmt).replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        return dt.astimezone(timezone.utc) if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
 # =============================================================================
 # 3. İlan.gov.tr Konkordato ve İflas İlanları
 # =============================================================================
-def fetch_ilan_gov_tr(session: requests.Session, existing_urls: Set[str], days: int = LOOKBACK_DAYS) -> List[dict]:
-    """İlan.gov.tr üzerinde son `days` gündeki Konkordato ve İflas/Tasfiye tebligatlarını arar."""
+def fetch_ilan_gov_tr(session: requests.Session, existing_urls: Set[str], days: int = LOOKBACK_DAYS,
+                      max_pages: int = 3, page_size: int = 50) -> List[dict]:
+    """İlan.gov.tr AdsByFilter + GetAdDetail API üzerinden son `days` gündeki Konkordato/İflas tebligatlarını çeker."""
     results: List[dict] = []
+    seen_ids: Set[str] = set()
     cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    ppdmin = cutoff.strftime("%d.%m.%Y")
     search_terms = ["konkordato", "geçici mühlet", "kesin mühlet", "iflas"]
 
     for term in search_terms:
-        payload = {
-            "searchText": term,
-            "skipCount": 0,
-            "maxResultCount": 50,
-            "sorting": "PublishDate DESC",
-        }
-        try:
-            res = session.post(ILAN_GOV_SEARCH_API, json=payload, timeout=20)
-            if res.status_code != 200:
-                logger.warning("İlan.gov.tr '%s' sorgusu HTTP %d döndü (uç nokta/erişim kontrol edilmeli).", term, res.status_code)
-                continue
-            data = res.json()
-            items = ((data.get("result") or {}).get("items")) or data.get("items") or []
-            for item in items:
-                ad_id = item.get("id") or item.get("adNo")
-                slug = item.get("urlSlug") or item.get("seoUrl") or str(ad_id)
-                url = urljoin(ILAN_GOV_DETAIL_BASE, str(slug))
-                if not ad_id or url in existing_urls:
-                    continue
+        for page in range(max_pages):
+            payload = {
+                "keys": {
+                    "q": [term],
+                    "ats": [ILAN_GOV_AD_TYPE_TEBLIGAT],
+                    "ppdmin": [ppdmin],
+                },
+                "skipCount": page * page_size,
+                "maxResultCount": page_size,
+            }
+            if page > 0:
+                payload["keys"]["currentPage"] = [page + 1]
+            try:
+                res = session.post(
+                    ILAN_GOV_SEARCH_API, json=payload, headers=ILAN_GOV_HEADERS, timeout=25, verify=False
+                )
+                if res.status_code != 200:
+                    logger.warning(
+                        "İlan.gov.tr '%s' (sayfa %d) sorgusu HTTP %d döndü (uç nokta/erişim kontrol edilmeli).",
+                        term, page + 1, res.status_code,
+                    )
+                    break
+                data = res.json()
+                result_obj = data.get("result") or {}
+                items = result_obj.get("ads") or []
+                if not items:
+                    break
 
-                pub_str = str(item.get("publishDate") or item.get("startDate") or "")[:10]
-                try:
-                    pub_dt = datetime.fromisoformat(pub_str).replace(tzinfo=timezone.utc)
-                    if pub_dt < cutoff:
+                for item in items:
+                    ad_id = str(item.get("id") or "").strip()
+                    if not ad_id or ad_id in seen_ids:
                         continue
-                    tarih = pub_dt.strftime("%Y-%m-%d")
-                except ValueError:
-                    tarih = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                    url_str = str(item.get("urlStr") or f"/ilan/{ad_id}")
+                    url = urljoin(ILAN_GOV_BASE, url_str)
+                    if url in existing_urls:
+                        seen_ids.add(ad_id)
+                        continue
 
-                title = str(item.get("title") or "Resmi Tebligat / Konkordato İlanı").strip()
-                raw_body = str(item.get("content") or item.get("summary") or item.get("description") or "")
-                body = BeautifulSoup(raw_body, "html.parser").get_text(" ", strip=True)
+                    pub_dt = _parse_ilan_date(item.get("publishStartDate") or item.get("publishDate"))
+                    if pub_dt is not None and pub_dt < cutoff:
+                        continue
+                    tarih = (pub_dt or datetime.now(timezone.utc)).strftime("%Y-%m-%d")
 
-                # İçerik özet halindeyse ilan detay sayfasından tam metni çek
-                if len(body) < 200 and url.startswith("http"):
+                    title = str(item.get("title") or "Resmi Tebligat / Konkordato İlanı").strip()
+                    advertiser = str(item.get("advertiserName") or "").strip()
+                    body = ""
                     try:
-                        d_res = session.get(url, timeout=15)
+                        d_res = session.get(
+                            ILAN_GOV_DETAIL_API, params={"id": ad_id}, headers=ILAN_GOV_HEADERS, timeout=20, verify=False
+                        )
                         if d_res.status_code == 200:
-                            soup = BeautifulSoup(d_res.text, "html.parser")
-                            detail_box = soup.find("div", class_=re.compile(r"(ad-detail|ilan-detay|content)", re.I))
-                            if detail_box:
-                                body = detail_box.get_text(" ", strip=True)
-                    except requests.RequestException:
-                        pass
+                            d_json = d_res.json()
+                            d_result = d_json.get("result") or {}
+                            raw_html = str(d_result.get("content") or "")
+                            body = BeautifulSoup(raw_html, "html.parser").get_text(" ", strip=True)
+                            if not advertiser:
+                                advertiser = str(d_result.get("advertiserName") or "").strip()
+                        else:
+                            logger.warning("İlan.gov.tr detay (id=%s) HTTP %d döndü.", ad_id, d_res.status_code)
+                    except requests.RequestException as exc:
+                        logger.warning("İlan.gov.tr detay (id=%s) çekilemedi: %s", ad_id, exc)
 
-                full_text = re.sub(r"\s+", " ", f"{title}. {body}").strip()
-                if len(full_text) < 80 or not RISK_KEYWORDS_RE.search(full_text):
-                    continue
+                    prefix = f"{title} ({advertiser})." if advertiser else f"{title}."
+                    full_text = re.sub(r"\s+", " ", f"{prefix} {body}").strip()
+                    seen_ids.add(ad_id)
+                    if len(full_text) < 80 or not RISK_KEYWORDS_RE.search(full_text):
+                        continue
 
-                id_tag = extract_identifiers(full_text)
-                existing_urls.add(url)
-                results.append({
-                    "Tarih": tarih,
-                    "Kaynak": "İlan.gov.tr",
-                    "Başlık": f"{title}{id_tag}",
-                    "URL": url,
-                    "Metin": full_text,
-                })
-        except Exception as exc:
-            logger.warning("İlan.gov.tr '%s' sorgusunda uyarı: %s", term, exc)
+                    id_tag = extract_identifiers(full_text)
+                    existing_urls.add(url)
+                    results.append({
+                        "Tarih": tarih,
+                        "Kaynak": "İlan.gov.tr",
+                        "Başlık": f"{title}{id_tag}",
+                        "URL": url,
+                        "Metin": full_text,
+                    })
+                    time.sleep(0.15)
+
+                if len(items) < page_size:
+                    break
+            except Exception as exc:
+                logger.warning("İlan.gov.tr '%s' (sayfa %d) sorgusunda uyarı: %s", term, page + 1, exc)
+                break
     logger.info("İlan.gov.tr: %d yeni resmi tebligat/konkordato ilanı bulundu.", len(results))
     return results
 
