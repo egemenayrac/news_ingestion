@@ -3,6 +3,8 @@
 Kurumsal Kredi Riski Erken Uyarı Sistemi (EWS) - Haber ve Bildirim Ingestion Katmanı
 """
 
+from __future__ import annotations
+
 import os
 import pathlib
 import io
@@ -13,6 +15,7 @@ import gzip
 import email.utils
 import warnings
 import getpass
+import threading
 import concurrent.futures
 from urllib.parse import urljoin, quote
 from datetime import datetime, timedelta, timezone
@@ -76,8 +79,6 @@ class HybridSession(requests.Session):
                 kwargs['proxies'] = {"http": self.custom_proxy_url, "https": self.custom_proxy_url}
             kwargs['verify'] = False if self.custom_proxy_url else True
         return super().request(method, url, **kwargs)
-
-import threading
 
 _PROXY_LOCK = threading.Lock()
 _PROXY_RESOLVED = False
