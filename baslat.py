@@ -137,6 +137,9 @@ def run_step(choice: str) -> None:
         portfolio_df.to_parquet(dwh.STRUCTURED_PARQUET_PATH, index=False, engine="pyarrow")
         dwh.create_portfolio_config(portfolio_df, partners_df)
 
+    elif choice in ("6", "incele"):
+        importlib.import_module("6_sirket_inceleme").main()
+
     elif choice in ("5", "backtest"):
         print("\n>>> Backtest (Lead Time & Performans Analizi) çalıştırılıyor (5_backtest.py)...")
         bt = importlib.import_module("5_backtest")
@@ -161,6 +164,7 @@ def main() -> None:
     print("  [3] Yalnızca Haber ve Resmi İlan Havuzunu Güncelle (LLM'e sormadan)")
     print("  [4] Oracle DWH'tan Portföy ve Finansalları Güncelle (2_sql_to_parquet.py)")
     print("  [5] Geriye Dönük Test (Backtest & Kurşun Süresi Raporu) Çalıştır")
+    print("  [6] Şirket İncele (ajan: EWS + ilan.gov.tr + KAP + Google News; kaynaklı not)")
     print("  [0] Çıkış")
 
     secim = input("\nSeçiminiz [Varsayılan=1]: ").strip() or "1"

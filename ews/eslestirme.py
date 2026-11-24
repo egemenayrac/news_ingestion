@@ -26,6 +26,7 @@ Girdi:  PARQUET_PATH (haberler; zorunlu kolonlar Başlık, Metin, Tarih), portfo
 from __future__ import annotations
 
 import bisect
+import importlib.util
 import logging
 import os
 import re
@@ -40,9 +41,21 @@ sys.path.insert(0, str(ROOT_DIR))
 import ayarlar  # noqa: E402
 from ews.text import normalize_text, normalize_with_offsets, to_original_span  # noqa: E402
 
-try:
-    from portfolio_config import COMPANIES  # noqa: E402
-except ImportError:  # config yoksa örnek iki şirketle çalışılır
+def _load_config(path) -> Optional[dict]:
+    """portfolio_config.py'yi dosya yolundan okur (data/ klasörüne taşınabilsin diye modül araması kullanılmaz)."""
+    try:
+        spec = importlib.util.spec_from_file_location("portfolio_config", str(path))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod.COMPANIES
+    except FileNotFoundError:
+        return None
+    except Exception as exc:  # bozuk config: sessizce örnek şirketlere düşmesin
+        raise RuntimeError(f"portfolio_config okunamadı ({path}): {exc}") from exc
+
+
+COMPANIES = _load_config(ayarlar.PORTFOLIO_CONFIG_PATH)
+if COMPANIES is None:  # config yoksa örnek iki şirketle çalışılır
     COMPANIES = {
         "COMP_01": {"aliases": ["ABC Holding", "ABC"], "name": "ABC Holding"},
         "COMP_02": {"aliases": ["XYZ Lojistik", "XYZ"], "name": "XYZ Lojistik"},

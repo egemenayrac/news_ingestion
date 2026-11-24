@@ -69,17 +69,38 @@ ALIAS_MIN_ESLESME = 3                  # Hiçbiri kabul edilmeyen alias için ç
 ZAYIF_DSCR = 1.2                       # Altındaki DSCR "zayıf finansal" sayılır (kâr düşüşüyle birleşince Stage 2)
 
 # =============================================================================
-# 5. DOSYA YOLLARI (Tümü proje kök dizininde; ağ klasörüyse buradan değiştirilebilir)
+# 5. DOSYA YOLLARI — veri ve çıktılar data/ klasöründe, kod ana klasörde
 # =============================================================================
-NEWS_PARQUET_PATH = ROOT_DIR / "news.parquet"
-STRUCTURED_PARQUET_PATH = ROOT_DIR / "structured_data.parquet"
-PORTFOLIO_CONFIG_PATH = ROOT_DIR / "portfolio_config.py"
-CACHE_PATH = ROOT_DIR / "llm_cache.jsonl"
-KONTROL_PATH = ROOT_DIR / "kontrol_etiketleri.jsonl"
-GECMIS_PATH = ROOT_DIR / "dashboard_gecmis.jsonl"
-EXCEL_OUTPUT_PATH = ROOT_DIR / "llm_dogrulama.xlsx"
-DASHBOARD_OUTPUT_PATH = ROOT_DIR / "dashboard.html"
-KEY_FILE_PATH = ROOT_DIR / ".llm_key.txt"
+DATA_DIR = ROOT_DIR / "data"
+try:
+    DATA_DIR.mkdir(exist_ok=True)
+except OSError:
+    pass
+_ESKI_YERDE = []
+
+
+def _veri(ad: str) -> Path:
+    """data/<ad>; dosya henüz data/'ya taşınmamış ama ana klasörde duruyorsa ana klasördeki kullanılır (veri kaybı
+    olmasın diye). Taşındıktan sonra kendiliğinden data/'dakine geçer."""
+    yeni, eski = DATA_DIR / ad, ROOT_DIR / ad
+    if not yeni.exists() and eski.exists():
+        _ESKI_YERDE.append(ad)
+        return eski
+    return yeni
+
+
+NEWS_PARQUET_PATH = _veri("news.parquet")
+STRUCTURED_PARQUET_PATH = _veri("structured_data.parquet")
+PORTFOLIO_CONFIG_PATH = _veri("portfolio_config.py")
+CACHE_PATH = _veri("llm_cache.jsonl")
+KONTROL_PATH = _veri("kontrol_etiketleri.jsonl")
+GECMIS_PATH = _veri("dashboard_gecmis.jsonl")
+EXCEL_OUTPUT_PATH = _veri("llm_dogrulama.xlsx")
+DASHBOARD_OUTPUT_PATH = _veri("dashboard.html")
+KEY_FILE_PATH = ROOT_DIR / ".llm_key.txt"     # anahtar dosyası ana klasörde kalır
+if _ESKI_YERDE:
+    print(f"[BİLGİ] Şu dosyalar hâlâ ana klasörde kullanılıyor; istediğinizde {DATA_DIR} klasörüne taşıyabilirsiniz: "
+          + ", ".join(_ESKI_YERDE))
 
 
 # =============================================================================
