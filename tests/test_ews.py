@@ -315,6 +315,10 @@ def test_ilan_gov_tr_api_and_vkn_extraction(monkeypatch):
     assert "3851381252" in masked
     assert "11305933184" not in masked
     assert "14456809940" not in masked
+    # Etiketsiz TCKN ve 11 haneli telefon da maskelenir; 16 haneli MERSİS korunur
+    bare = mod.mask_tckn("Hukukçu Ad Soyad 12345678901, Tel: 05321234567, MERSİS 0987654321098765")
+    assert "12345678901" not in bare and "05321234567" not in bare
+    assert "0987654321098765" in bare
 
     today_tr = datetime.now(timezone.utc).strftime("%d.%m.%Y")
     seen_posts = []

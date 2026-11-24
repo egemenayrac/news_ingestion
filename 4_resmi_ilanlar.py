@@ -49,6 +49,7 @@ RESMI_GAZETE_BASE = "https://www.resmigazete.gov.tr"
 ILAN_GOV_BASE = "https://www.ilan.gov.tr"
 ILAN_GOV_SEARCH_API = f"{ILAN_GOV_BASE}/api/api/services/app/Ad/AdsByFilter"
 ILAN_GOV_DETAIL_API = f"{ILAN_GOV_BASE}/api/api/services/app/AdDetail/GetAdDetail"
+ILAN_GOV_PAGE_SIZE = 20  # sunucu maxResultCount'u yok sayıp sayfa başına 20 ilan döndürüyor (canlı API, 24 Kasım)
 ILAN_GOV_AD_TYPE_TEBLIGAT = 4  # 2=İcra, 3=İhale, 4=Tebligat (Konkordato ve İflas Hukuku Davaları dahil), 5=Personel
 ILAN_GOV_HEADERS = {
     "accept": "text/plain, application/json",
@@ -76,6 +77,9 @@ MERSIS_PATTERNS = (
 TCKN_MASK_PATTERNS = (
     (re.compile(r"(\b(?:T\.?\s*C\.?\s*(?:Kimlik)?\s*(?:No|Numaras[ıi])?|TCKN)\s*[:.]?\s*)\d{11}\b", re.IGNORECASE), r"\1***"),
     (re.compile(r"\b\d{11}(\s*(?:T\.?\s*C\.?\s*(?:Kimlik)?\s*(?:numaral[ıi]|no['’]?lu)|TCKN['’]?li))\b", re.IGNORECASE), r"***\1"),
+    # Etiketsiz 11 haneli sayılar da maskelenir (ilanlarda "Ad Soyad 12345678901," ve 11 haneli telefonlar görüldü).
+    # 10 haneli VKN ve 16 haneli MERSİS rakam sınırları sayesinde etkilenmez.
+    (re.compile(r"(?<!\d)\d{11}(?!\d)"), "***"),
 )
 
 
@@ -137,7 +141,7 @@ def _parse_ilan_date(raw: object) -> Optional[datetime]:
 # 3. İlan.gov.tr Konkordato ve İflas İlanları
 # =============================================================================
 def fetch_ilan_gov_tr(session: requests.Session, existing_urls: Set[str], days: int = LOOKBACK_DAYS,
-                      max_pages: int = 3, page_size: int = 50) -> List[dict]:
+                      max_pages: int = 15, page_size: int = ILAN_GOV_PAGE_SIZE) -> List[dict]:
     """İlan.gov.tr AdsByFilter + GetAdDetail API üzerinden son `days` gündeki Konkordato/İflas tebligatlarını çeker."""
     results: List[dict] = []
     seen_ids: Set[str] = set()
@@ -173,6 +177,7 @@ def fetch_ilan_gov_tr(session: requests.Session, existing_urls: Set[str], days: 
                 items = result_obj.get("ads") or []
                 if not items:
                     break
+                total = result_obj.get("numFound")
 
                 for item in items:
                     ad_id = str(item.get("id") or "").strip()
@@ -225,7 +230,7 @@ def fetch_ilan_gov_tr(session: requests.Session, existing_urls: Set[str], days: 
                     })
                     time.sleep(0.15)
 
-                if len(items) < page_size:
+                if len(items) < page_size or (isinstance(total, int) and (page + 1) * page_size >= total):
                     break
             except Exception as exc:
                 logger.warning("İlan.gov.tr '%s' (sayfa %d) sorgusunda uyarı: %s", term, page + 1, exc)
