@@ -30,6 +30,7 @@ PROXY_HOST = "<PROXY_HOST>:<PORT>"     # Örn: "proxy.banka.com.tr:8080"
 PROXY_BYPASS_DOMAINS = ["cnbce.com"]   # BANK modunda bile proxy'siz gidilecek siteler
 LOOKBACK_DAYS = 10                     # Haber ve resmi ilan taramasında geriye dönük gün sayısı
 ENABLE_KAP_CRAWLING = False            # KAP bildirim taraması (True / False)
+ENABLE_RESMI_ILANLAR = False           # İlan.gov.tr & Resmî Gazete taraması (ayarlar_local.py'de True yapılabilir)
 SCRAPER_MAX_WORKERS = 8                # Eşzamanlı haber indirme iş parçacığı sayısı
 
 # =============================================================================

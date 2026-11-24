@@ -93,9 +93,12 @@ def run_step(choice: str) -> None:
         scraper = importlib.import_module("1_scraper")
         scraper.run_ingestion_pipeline()
 
-        print("\n>>> [ADIM 2/3] Resmi İlanlar (İlan.gov.tr & Resmî Gazete) Taranıyor (4_resmi_ilanlar.py)...")
-        resmi = importlib.import_module("4_resmi_ilanlar")
-        resmi.run_official_gazette_pipeline()
+        if getattr(ayarlar, "ENABLE_RESMI_ILANLAR", False):
+            print("\n>>> [ADIM 2/3] Resmi İlanlar (İlan.gov.tr & Resmî Gazete) Taranıyor (4_resmi_ilanlar.py)...")
+            resmi = importlib.import_module("4_resmi_ilanlar")
+            resmi.run_official_gazette_pipeline()
+        else:
+            print("\n>>> [ADIM 2/3] Resmi İlanlar kapalı (ayarlar.ENABLE_RESMI_ILANLAR = False); atlandı.")
 
         print("\n>>> [ADIM 3/3] LLM Doğrulama, Olay Defteri, Finansal Skor ve Dashboard Üretiliyor (3_llm_dogrulama.py)...")
         dogrulama = importlib.import_module("3_llm_dogrulama")
@@ -119,9 +122,13 @@ def run_step(choice: str) -> None:
                 pass
 
     elif choice in ("3", "haber"):
-        print("\n>>> Ekonomi basını ve resmi ilanlar taranıyor...")
+        print("\n>>> Ekonomi basını haberleri taranıyor...")
         importlib.import_module("1_scraper").run_ingestion_pipeline()
-        importlib.import_module("4_resmi_ilanlar").run_official_gazette_pipeline()
+        if getattr(ayarlar, "ENABLE_RESMI_ILANLAR", False):
+            print("\n>>> Resmi ilanlar taranıyor...")
+            importlib.import_module("4_resmi_ilanlar").run_official_gazette_pipeline()
+        else:
+            print("\n>>> Resmi ilanlar kapalı (ayarlar.ENABLE_RESMI_ILANLAR = False); atlandı.")
 
     elif choice in ("4", "oracle"):
         print("\n>>> Oracle DWH üzerinden portföy, finansallar ve ortaklar güncelleniyor (2_sql_to_parquet.py)...")

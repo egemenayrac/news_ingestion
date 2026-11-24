@@ -308,6 +308,14 @@ def test_ilan_gov_tr_api_and_vkn_extraction(monkeypatch):
     assert "3851381252" in tag
     assert "1234567890" in tag
 
+    # Gerçek kişi TCKN'leri maskelenmeli, 10 haneli şirket VKN'si korunmalı
+    masked = mod.mask_tckn(
+        "3851381252 vergi numaralı FEY A.Ş., 11305933184 TC Kimlik numaralı Kişi ve komiser (TC. 14456809940)."
+    )
+    assert "3851381252" in masked
+    assert "11305933184" not in masked
+    assert "14456809940" not in masked
+
     today_tr = datetime.now(timezone.utc).strftime("%d.%m.%Y")
     seen_posts = []
     seen_gets = []
@@ -321,7 +329,8 @@ def test_ilan_gov_tr_api_and_vkn_extraction(monkeypatch):
             return self._body
 
     class FakeSession:
-        def post(self, url, json=None, headers=None, timeout=None, verify=None):
+        def post(self, url, json=None, headers=None, timeout=None, **kwargs):
+            assert "verify" not in kwargs  # TLS ayarı session.verify'dan gelmeli
             seen_posts.append((url, json, headers))
             return FakeResp(200, {
                 "success": True,
@@ -338,15 +347,17 @@ def test_ilan_gov_tr_api_and_vkn_extraction(monkeypatch):
                 },
             })
 
-        def get(self, url, params=None, headers=None, timeout=None, verify=None):
+        def get(self, url, params=None, headers=None, timeout=None, **kwargs):
+            assert "verify" not in kwargs  # TLS ayarı session.verify'dan gelmeli
             seen_gets.append((url, params, headers))
             return FakeResp(200, {
                 "success": True,
                 "result": {
                     "id": 2291587,
                     "content": (
-                        "<p>3851381252 vergi numaralı FEY KONFEKSİYON A.Ş. hakkında üç ay süre ile "
-                        "GEÇİCİ MÜHLET kararı verilmesine ve konkordato komiseri atanmasına karar verildi.</p>"
+                        "<p>3851381252 vergi numaralı FEY KONFEKSİYON A.Ş. ve 11305933184 TC Kimlik numaralı "
+                        "kişi hakkında üç ay süre ile GEÇİCİ MÜHLET kararı verilmesine ve konkordato komiseri "
+                        "(TC. 14456809940) atanmasına karar verildi.</p>"
                     ),
                 },
             })
@@ -362,4 +373,25 @@ def test_ilan_gov_tr_api_and_vkn_extraction(monkeypatch):
     assert "[VKN: 3851381252]" in rows[0]["Başlık"]
     assert rows[0]["URL"] == "https://www.ilan.gov.tr/ilan/2291587/konkordato-muhlet-karari"
     assert "GEÇİCİ MÜHLET" in rows[0]["Metin"]
+    assert "11305933184" not in rows[0]["Metin"]
+    assert "14456809940" not in rows[0]["Metin"]
+
+
+def test_baslat_respects_enable_resmi_ilanlar(monkeypatch):
+    baslat = importlib.import_module("baslat")
+    scraper = importlib.import_module("1_scraper")
+    resmi = importlib.import_module("4_resmi_ilanlar")
+    called = {"scraper": 0, "resmi": 0}
+
+    monkeypatch.setattr(scraper, "run_ingestion_pipeline", lambda: called.__setitem__("scraper", called["scraper"] + 1))
+    monkeypatch.setattr(resmi, "run_official_gazette_pipeline", lambda: called.__setitem__("resmi", called["resmi"] + 1))
+
+    monkeypatch.setattr(ayarlar, "ENABLE_RESMI_ILANLAR", False)
+    baslat.run_step("3")
+    assert called == {"scraper": 1, "resmi": 0}
+
+    monkeypatch.setattr(ayarlar, "ENABLE_RESMI_ILANLAR", True)
+    baslat.run_step("3")
+    assert called == {"scraper": 2, "resmi": 1}
+
 

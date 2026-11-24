@@ -73,6 +73,10 @@ MERSIS_PATTERNS = (
     re.compile(r"\b(?:MERS[İI]S|Mersis)\s*(?:No|Numaras[ıi])?\s*[:.]?\s*(\d{16})\b", re.IGNORECASE),
     re.compile(r"\b(\d{16})\s*(?:MERS[İI]S|Mersis)\s*(?:numaral[ıi]|no['’]?lu)?\b", re.IGNORECASE),
 )
+TCKN_MASK_PATTERNS = (
+    (re.compile(r"(\b(?:T\.?\s*C\.?\s*(?:Kimlik)?\s*(?:No|Numaras[ıi])?|TCKN)\s*[:.]?\s*)\d{11}\b", re.IGNORECASE), r"\1***"),
+    (re.compile(r"\b\d{11}(\s*(?:T\.?\s*C\.?\s*(?:Kimlik)?\s*(?:numaral[ıi]|no['’]?lu)|TCKN['’]?li))\b", re.IGNORECASE), r"***\1"),
+)
 
 
 # =============================================================================
@@ -89,6 +93,14 @@ def create_session() -> requests.Session:
         session.proxies.update({"http": proxy_url, "https": proxy_url})
         session.verify = False
     return session
+
+
+def mask_tckn(text: str) -> str:
+    """İlan metnindeki 11 haneli gerçek kişi TCKN'lerini maskeler; 10 haneli VKN ve 16 haneli MERSİS korunur."""
+    masked = text or ""
+    for pat, repl in TCKN_MASK_PATTERNS:
+        masked = pat.sub(repl, masked)
+    return masked
 
 
 def extract_identifiers(text: str) -> str:
@@ -148,7 +160,7 @@ def fetch_ilan_gov_tr(session: requests.Session, existing_urls: Set[str], days: 
                 payload["keys"]["currentPage"] = [page + 1]
             try:
                 res = session.post(
-                    ILAN_GOV_SEARCH_API, json=payload, headers=ILAN_GOV_HEADERS, timeout=25, verify=False
+                    ILAN_GOV_SEARCH_API, json=payload, headers=ILAN_GOV_HEADERS, timeout=25
                 )
                 if res.status_code != 200:
                     logger.warning(
@@ -182,7 +194,7 @@ def fetch_ilan_gov_tr(session: requests.Session, existing_urls: Set[str], days: 
                     body = ""
                     try:
                         d_res = session.get(
-                            ILAN_GOV_DETAIL_API, params={"id": ad_id}, headers=ILAN_GOV_HEADERS, timeout=20, verify=False
+                            ILAN_GOV_DETAIL_API, params={"id": ad_id}, headers=ILAN_GOV_HEADERS, timeout=20
                         )
                         if d_res.status_code == 200:
                             d_json = d_res.json()
@@ -197,7 +209,7 @@ def fetch_ilan_gov_tr(session: requests.Session, existing_urls: Set[str], days: 
                         logger.warning("İlan.gov.tr detay (id=%s) çekilemedi: %s", ad_id, exc)
 
                     prefix = f"{title} ({advertiser})." if advertiser else f"{title}."
-                    full_text = re.sub(r"\s+", " ", f"{prefix} {body}").strip()
+                    full_text = mask_tckn(re.sub(r"\s+", " ", f"{prefix} {body}").strip())
                     seen_ids.add(ad_id)
                     if len(full_text) < 80 or not RISK_KEYWORDS_RE.search(full_text):
                         continue
@@ -252,7 +264,7 @@ def fetch_resmi_gazete(session: requests.Session, existing_urls: Set[str], days:
                     if sub_res.status_code != 200:
                         continue
                     sub_soup = BeautifulSoup(sub_res.content, "html.parser")
-                    text = re.sub(r"\s+", " ", sub_soup.get_text(" ", strip=True))
+                    text = mask_tckn(re.sub(r"\s+", " ", sub_soup.get_text(" ", strip=True)))
                     if len(text) < 150 or not RISK_KEYWORDS_RE.search(text):
                         continue
                     title_el = sub_soup.find(["h1", "h2", "b", "strong"])
