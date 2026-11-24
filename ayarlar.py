@@ -68,6 +68,10 @@ AGGREGATION_WINDOW_DAYS = 180          # Haber eşleştirme penceresi (son 180 g
 ALIAS_MIN_ESLESME = 3                  # Hiçbiri kabul edilmeyen alias için çıkarma önerisi alt sınırı
 ZAYIF_DSCR = 1.2                       # Altındaki DSCR "zayıf finansal" sayılır (kâr düşüşüyle birleşince Stage 2)
 
+# Şirket inceleme ajanı (dwh_agent Streamlit arayüzü). Doluysa dashboard'daki şirket panelinde
+# "Ajanla incele" bağlantısı görünür; ör. "http://localhost:8501". Boşsa bağlantı gösterilmez.
+AJAN_URL = ""
+
 # =============================================================================
 # 5. DOSYA YOLLARI (Tümü proje kök dizininde; ağ klasörüyse buradan değiştirilebilir)
 # =============================================================================

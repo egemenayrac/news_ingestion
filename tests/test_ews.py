@@ -399,3 +399,13 @@ def test_baslat_respects_enable_resmi_ilanlar(monkeypatch):
     assert called == {"scraper": 2, "resmi": 1}
 
 
+
+
+def test_dashboard_ajan_url_from_ayarlar(monkeypatch):
+    from ews import dashboard as ews_dashboard
+
+    monkeypatch.setattr(ayarlar, "AJAN_URL", "")
+    assert ews_dashboard._ajan_url() == ""
+    monkeypatch.setattr(ayarlar, "AJAN_URL", " http://localhost:8501 ")
+    assert ews_dashboard._ajan_url() == "http://localhost:8501"
+    assert "D.meta.ajan_url" in ews_dashboard._TEMPLATE and "?sirket=" in ews_dashboard._TEMPLATE

@@ -196,6 +196,15 @@ def _compact(snap: dict) -> dict:
 # =============================================================================
 # Yazma
 # =============================================================================
+def _ajan_url() -> str:
+    """Şirket inceleme ajanının adresi (ayarlar.AJAN_URL); tanımlı değilse boş."""
+    try:
+        import ayarlar
+        return str(getattr(ayarlar, "AJAN_URL", "") or "").strip()
+    except ImportError:
+        return ""
+
+
 def write_dashboard(df: pd.DataFrame, companies: pd.DataFrame, combined: pd.DataFrame,
                     ledgers: Dict[object, List[Olay]], themes: pd.DataFrame, aliases: pd.DataFrame,
                     errors: int, html_path: Path, history_path: Path) -> Path:
@@ -214,7 +223,7 @@ def write_dashboard(df: pd.DataFrame, companies: pd.DataFrame, combined: pd.Data
 
     dates = df["Tarih"].dropna().astype(str)
     data = {
-        "meta": {"zaman": now.strftime("%Y-%m-%d %H:%M"), "gun": day, "eslesme": len(df),
+        "meta": {"zaman": now.strftime("%Y-%m-%d %H:%M"), "gun": day, "eslesme": len(df), "ajan_url": _ajan_url(),
                  "cevap": int(answered(df).sum()), "hata": errors, "portfoy": len(comp),
                  "haberli": sum(c["h"] is not None for c in comp), "prompt": PROMPT_SURUMU,
                  "haber_ilk": dates.min()[:10] if len(dates) else None, "haber_son": dates.max()[:10] if len(dates) else None},
@@ -616,7 +625,9 @@ function openCompany(k) {
     "<div><b>Birleşik skor</b>" + skor(s.bs) + " / 100</div><div><b>Haber skoru</b>" + skor(s.hs) + "</div>" +
     "<div><b>Bakiye</b>" + tl(s.bakiye) + "</div><div><b>Seviyenin kaynağı</b>" + esc(s.kural) + "</div>" +
     (s.eslesme != null ? "<div><b>Haber eşleşmesi</b>" + s.eslesme + " (odak " + s.odak + ", reddedilen " + s.red + ")</div>" : "<div><b>Haber</b>Haber penceresinde eşleşen haber yok</div>") +
-    "</div>" + (s.hesap ? '<p class="small muted">Haber skoru hesabı: ' + esc(s.hesap) + "</p>" : "");
+    "</div>" + (s.hesap ? '<p class="small muted">Haber skoru hesabı: ' + esc(s.hesap) + "</p>" : "") +
+    (D.meta.ajan_url ? '<p>' + link(D.meta.ajan_url.replace(/\/+$/, "") + "/?sirket=" + encodeURIComponent(s.k), "🔎 Ajanla incele") +
+      ' <span class="small muted">(EWS + ilan.gov.tr + Google News + KAP; kaynaklı not taslağı, 1-3 dk)</span></p>' : "");
   html += "<h3>Olay defteri</h3>" + (ev.length ? ev.map(function (e) {
     return '<div class="ev ' + e.durum + '"><div class="ev-h"><b>[' + esc(e.kod) + "] " + esc(tip(e.tip)) + "</b>" + chip(e.etki) +
       (e.durum === "acik" ? '<span class="badge open">açık</span>' : '<span class="badge">kapandı ' + esc(e.kapanis) + "</span>") +
