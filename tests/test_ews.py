@@ -399,3 +399,296 @@ def test_baslat_respects_enable_resmi_ilanlar(monkeypatch):
     assert called == {"scraper": 2, "resmi": 1}
 
 
+def test_ews_schemas_pydantic_v2_validation():
+    from ews import schemas
+
+    # Alaka: bilinmeyen değer güvenli tarafa ("ikincil") çekilir
+    a1 = schemas.validate_alaka({"alaka": "ODAK", "gerekce": "  Şirket doğrudan haberin konusu.  "})
+    assert a1.alaka == "odak"
+    assert a1.gerekce == "Şirket doğrudan haberin konusu."
+    a2 = schemas.validate_alaka({"alaka": "bilinmeyen_deger"})
+    assert a2.alaka == "ikincil"
+
+    # Olay: riskli tipte boş risk_turu -> kredi; risksiz tipte risk_turu -> ""
+    o1 = schemas.validate_olay({"olay_tipi": "konkordato_iflas", "durum": "GERCEKLESTI", "risk_turu": ""})
+    assert o1.olay_tipi == "konkordato_iflas"
+    assert o1.durum == "gerceklesti"
+    assert o1.risk_turu == "kredi"
+
+    o2 = schemas.validate_olay({"olay_tipi": "rutin", "durum": "bilinmeyen", "risk_turu": "kredi"})
+    assert o2.olay_tipi == "rutin"
+    assert o2.durum == "iddia"
+    assert o2.risk_turu == ""
+
+    # Defter bağlama: köşeli parantez temizliği
+    d1 = schemas.validate_defter_bag({"islem": "KAPAT", "olay": " [O2] ", "gerekce": "Tedbir kalktı"})
+    assert d1.islem == "kapat" and d1.olay == "O2"
+
+    # Temalar: eski ortak_ifade alanı ve string madde numaraları dönüşümü
+    t1 = schemas.validate_temalar({
+        "temalar": [{
+            "tema": "Enerji Maliyet Şoku",
+            "aciklama": "Elektrik zammı baskısı",
+            "ortak_ifade": "elektrik, enerji",
+            "maddeler": ["0", 1, "gecersiz"],
+        }]
+    })
+    assert len(t1.temalar) == 1
+    assert t1.temalar[0].kanit_kelimeler == ["elektrik", "enerji"]
+    assert t1.temalar[0].maddeler == [0, 1]
+
+
+def test_llm_client_openai_sdk_httpx_tenacity_retry(monkeypatch):
+    import httpx
+    from ews import schemas
+
+    assert ews_llm.openai_base_url("https://ibthink.banka.local/v1/chat/completions") == "https://ibthink.banka.local/v1"
+    assert ews_llm.build_httpx_verify(False) is False
+    assert ews_llm.build_httpx_verify(True) is True
+
+    attempts = {"n": 0}
+    seen_bodies = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts["n"] += 1
+        body = json.loads(request.content.decode("utf-8"))
+        seen_bodies.append(body)
+        if attempts["n"] == 1:
+            return httpx.Response(429, headers={"Retry-After": "0"}, json={"error": {"message": "rate limit"}})
+        if attempts["n"] == 2:
+            return httpx.Response(503, json={"error": {"message": "busy"}})
+        return httpx.Response(200, json={
+            "id": "cmpl-ews-1",
+            "object": "chat.completion",
+            "created": 1,
+            "model": "qwen3-27b",
+            "choices": [{
+                "index": 0,
+                "finish_reason": "stop",
+                "message": {"role": "assistant", "content": '<think>analiz</think>{"alaka": "odak", "gerekce": "doğrudan ilgili"}'},
+            }],
+        })
+
+    client = ews_llm.LLMClient(url="https://ibthink.local/v1/chat/completions", key="Bearer sk-test", model="", retries=4)
+    mock_http = httpx.Client(transport=httpx.MockTransport(handler))
+    monkeypatch.setattr(client, "_get_session", lambda: mock_http)
+    monkeypatch.setattr(ews_llm._WaitWithRetryAfter, "__call__", lambda self, rs: 0.0)
+
+    obj, status = client.ask("sys", "usr", response_model=schemas.AlakaResponse)
+    assert status == "ok"
+    assert attempts["n"] == 3
+    assert obj == {"alaka": "odak", "gerekce": "doğrudan ilgili"}
+    # model="" olduğunda kurumsal endpoint uyumu için payload'da "model" gönderilmemeli
+    assert "model" not in seen_bodies[0]
+
+    # 401 yetki hatasında tekrar denemeden hemen dönmeli
+    auth_calls = {"n": 0}
+
+    def auth_handler(request: httpx.Request) -> httpx.Response:
+        auth_calls["n"] += 1
+        return httpx.Response(401, json={"error": {"message": "unauthorized"}})
+
+    auth_client = ews_llm.LLMClient(url="https://ibthink.local/v1/chat/completions", key="bad", retries=3)
+    monkeypatch.setattr(auth_client, "_get_session", lambda: httpx.Client(transport=httpx.MockTransport(auth_handler)))
+    res_obj, res_status = auth_client.ask("sys", "usr")
+    assert res_obj is None
+    assert "401" in res_status and auth_calls["n"] == 1
+
+
+def test_borsa_bulteni_prefilter_agency_dedup_and_fastpath(tmp_path, monkeypatch):
+    from ews import eslestirme, text as ews_text
+
+    # 1) Borsa bülteni ön filtresi + kredi riski güvenlik koruması
+    assert eslestirme.is_borsa_bulteni(
+        "Borsa İstanbul'da günün en çok kazandıran ve kaybettiren hisseleri",
+        "BIST 100 endeksi günü yükselişle kapattı, ABC Holding %2 yükseldi.",
+        "Bloomberg HT",
+    ) is True
+    assert eslestirme.is_borsa_bulteni(
+        "BIST 100 güne düşüşle başladı: ABC Holding hakkında konkordato talebi",
+        "Mahkeme ABC Holding için geçici mühlet kararı verdi.",
+        "Bloomberg HT",
+    ) is False
+    assert eslestirme.is_borsa_bulteni(
+        "Günün en çok işlem gören hisseleri",
+        "Konkordato komiser heyeti atandı.",
+        "İlan.gov.tr",
+    ) is False
+
+    # 2) Kopya ajans haberi tekilleştirme (en uzun metin korunur, resmi ilanlar korunur)
+    dup_df = pd.DataFrame([
+        {
+            "Tarih": "2026-11-20", "Kaynak": "Dünya Gazetesi", "URL": "https://dunya.com/1",
+            "Başlık": "ABC Holding yeni tesis yatırımı için krediyi yapılandırdı",
+            "Metin": "Kısa özet: ABC Holding kredi yapılandırması imzaladı.",
+        },
+        {
+            "Tarih": "2026-11-20", "Kaynak": "Bloomberg HT", "URL": "https://bloomberght.com/1",
+            "Başlık": "ABC Holding yeni tesis yatırımı için krediyi yapılandırdı",
+            "Metin": "Uzun ajans metni: ABC Holding bankalarla yürüttüğü görüşmeler sonucunda 2 milyar TL tutarındaki kredisini 5 yıl vadeyle yapılandırdığını duyurdu.",
+        },
+        {
+            "Tarih": "2026-11-20", "Kaynak": "Ekonomim", "URL": "https://ekonomim.com/2",
+            "Başlık": "XYZ Lojistik liman operasyonlarında grev kararı alındı",
+            "Metin": "XYZ Lojistik çalışanları sendika kararıyla iş bıraktı.",
+        },
+    ])
+    deduped, n_removed = eslestirme.dedup_agency_news(dup_df)
+    assert n_removed == 1
+    assert len(deduped) == 2
+    assert "Bloomberg HT" in set(deduped["Kaynak"])  # daha uzun metinli kopya korundu
+    assert "Ekonomim" in set(deduped["Kaynak"])
+
+    # 3) Fast-path normalizasyon ve eşleştirme paritesi (ASCII/TR + Unicode ellipsis '…')
+    orig_companies = eslestirme.COMPANIES
+    try:
+        eslestirme.set_companies({
+            101: {"name": "ABC Holding A.Ş.", "aliases": ["ABC Holding", "ABC"], "tickers": ["ABCH"]},
+            102: {"name": "XYZ Lojistik A.Ş.", "aliases": ["XYZ Lojistik"], "tickers": ["XYZL"]},
+        })
+        assert ews_text.fast_normalize_if_1to1("Gümüşhane'de ABC Holding") == "gumushane'de abc holding"
+        assert ews_text.fast_normalize_if_1to1("ABC Holding… konkordato") is None  # '…' -> full offset yolu
+
+        r_fast = eslestirme.match_record("ABC Holding kredi yapılandırdı", "ABCH hissesi günü sakin tamamladı.")
+        assert len(r_fast) == 1 and r_fast[0]["company_key"] == 101
+
+        r_uni = eslestirme.match_record("Gündem…", "ABC Holding… bugün önemli bir açıklama yaptı ve borç yapılandırdı.")
+        assert len(r_uni) == 1 and r_uni[0]["company_key"] == 101
+
+        r_miss = eslestirme.match_record("Merkez Bankası faiz kararı", "Piyasalar kararı bekliyor.")
+        assert r_miss == []
+
+        # run_matching uçtan uca: borsa bülteni elenir, ajans kopyası tekilleşir, gerçek risk haberi eşleşir
+        pq_path = tmp_path / "news.parquet"
+        pd.concat([
+            dup_df,
+            pd.DataFrame([{
+                "Tarih": "2026-11-20", "Kaynak": "CNBC-e", "URL": "https://cnbce.com/bulten",
+                "Başlık": "Borsa İstanbul'da günün en çok kazandıran hisseleri",
+                "Metin": "Bugün ABCH ve XYZL en çok yükselenler arasında yer aldı.",
+            }]),
+        ], ignore_index=True).to_parquet(pq_path, index=False)
+        monkeypatch.setattr(eslestirme, "PARQUET_PATH", str(pq_path))
+        matched = eslestirme.run_matching(as_of="2026-11-24", window_days=30, filter_bulletins=True, dedup_agency=True)
+        assert set(matched["Şirket"]) == {101, 102}
+        assert len(matched) == 2
+        assert "https://cnbce.com/bulten" not in set(matched["URL"])
+    finally:
+        eslestirme.set_companies(orig_companies)
+
+
+def test_duckdb_analytics_source_health_and_portfolio_summary(tmp_path):
+    from ews import analytics
+
+    news_pq = tmp_path / "news.parquet"
+    pd.DataFrame([
+        {"Tarih": "2026-11-24", "Kaynak": "Bloomberg HT", "Başlık": "H1", "URL": "https://b/1", "Metin": "M1"},
+        {"Tarih": "2026-11-23", "Kaynak": "Bloomberg HT", "Başlık": "H2", "URL": "https://b/2", "Metin": "M2"},
+        {"Tarih": "2026-11-20", "Kaynak": "Dünya Gazetesi", "Başlık": "H3", "URL": "https://d/1", "Metin": "M3"},
+        {"Tarih": "2026-11-05", "Kaynak": "Ekonomim", "Başlık": "H4", "URL": "https://e/1", "Metin": "M4"},
+        {"Tarih": "2026-11-24", "Kaynak": "Resmî Gazete", "Başlık": "İlan", "URL": "https://rg/1", "Metin": "M5"},
+    ]).to_parquet(news_pq, index=False)
+
+    stats = analytics.news_pool_stats(news_pq)
+    assert stats["mevcut"] is True
+    assert stats["toplam_haber"] == 5
+    assert stats["kaynak_sayisi"] == 4
+    assert stats["resmi_ilan_sayisi"] == 1
+
+    health = analytics.source_health_summary(news_pq, days=14, as_of="2026-11-24").set_index("Kaynak")
+    assert health.loc["Bloomberg HT", "Saglik_Durumu"] == "SAĞLIKLI"
+    assert health.loc["Dünya Gazetesi", "Saglik_Durumu"] == "UYARI"
+    assert health.loc["Ekonomim", "Saglik_Durumu"] == "KESİNTİ"
+
+    matrix = analytics.daily_source_matrix(news_pq, days=14, as_of="2026-11-24")
+    assert int(matrix.loc["Bloomberg HT", "2026-11-24"]) == 1
+
+    struct_pq = tmp_path / "structured_data.parquet"
+    pd.DataFrame([
+        {"counterparty_id": 101, "sektor": "İnşaat", "toplam_bakiye_try": 150_000_000.0, "finansal_tarih": "2025-12-31"},
+        {"counterparty_id": 102, "sektor": "Enerji", "toplam_bakiye_try": 250_000_000.0, "finansal_tarih": "2025-12-31"},
+    ]).to_parquet(struct_pq, index=False)
+
+    fin_sum = analytics.portfolio_financial_summary(struct_pq)
+    assert fin_sum["sirket_sayisi"] == 2
+    assert fin_sum["toplam_bakiye_try"] == 400_000_000.0
+    assert len(fin_sum["sektor_ozeti"]) == 2
+
+    q_df = analytics.query_parquet("SELECT Kaynak, COUNT(*) AS n FROM news GROUP BY Kaynak", news_parquet=news_pq)
+    assert len(q_df) == 4
+
+    try:
+        analytics.query_parquet("DROP TABLE news", news_parquet=news_pq)
+        assert False, "Yazma sorgusu engellenmeliydi"
+    except ValueError:
+        pass
+
+
+def test_resmi_gazete_pdf_extraction_and_tckn_masking(monkeypatch):
+    import io
+
+    mod = importlib.import_module("4_resmi_ilanlar")
+    monkeypatch.setattr(mod.time, "sleep", lambda _s: None)
+
+    def _make_pdf(text: str) -> bytes:
+        esc = text.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+        stream = f"BT /F1 12 Tf 50 700 Td ({esc}) Tj ET".encode("latin-1")
+        objs = [
+            b"1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n",
+            b"2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj\n",
+            b"3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >> endobj\n",
+            b"4 0 obj << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> endobj\n",
+            f"5 0 obj << /Length {len(stream)} >> stream\n".encode("ascii") + stream + b"\nendstream endobj\n",
+        ]
+        buf = io.BytesIO()
+        buf.write(b"%PDF-1.4\n")
+        offsets = []
+        for obj in objs:
+            offsets.append(buf.tell())
+            buf.write(obj)
+        xref = buf.tell()
+        buf.write(f"xref\n0 {len(objs) + 1}\n0000000000 65535 f \n".encode("ascii"))
+        for off in offsets:
+            buf.write(f"{off:010d} 00000 n \n".encode("ascii"))
+        buf.write(f"trailer << /Size {len(objs) + 1} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n".encode("ascii"))
+        return buf.getvalue()
+
+    pdf_bytes = _make_pdf(
+        "TMSF ve ihale yasaklama karari: VKN: 3851381252 MERSIS: 0987654321098765 "
+        "ABC INSAAT A.S. hakkinda yasaklama karari verilmistir. Yetkili TCKN: 12345678901 "
+        "ve kefil Ad Soyad 24681357902 kayitlidir."
+    )
+
+    extracted = mod.extract_pdf_text(pdf_bytes)
+    assert "TMSF" in extracted
+    assert "3851381252" in extracted
+    assert "0987654321098765" in extracted
+    assert "12345678901" not in extracted
+    assert "24681357902" not in extracted
+
+    class FakeResp:
+        def __init__(self, status_code, content, headers=None):
+            self.status_code = status_code
+            self.content = content
+            self.headers = headers or {}
+
+    class FakeSession:
+        def get(self, url, timeout=None):
+            if url.endswith("-4.htm"):
+                html = b'<html><body><a href="20261124-4-1.pdf">TMSF ve Ihale Yasaklama Ilani 11122233344</a></body></html>'
+                return FakeResp(200, html, {"Content-Type": "text/html"})
+            if url.endswith(".pdf"):
+                return FakeResp(200, pdf_bytes, {"Content-Type": "application/pdf"})
+            return FakeResp(404, b"")
+
+    rows = mod.fetch_resmi_gazete(FakeSession(), existing_urls=set(), days=0)
+    assert len(rows) == 1
+    assert rows[0]["Kaynak"] == "Resmî Gazete"
+    assert rows[0]["URL"].endswith("20261124-4-1.pdf")
+    assert "[VKN: 3851381252; MERSİS: 0987654321098765]" in rows[0]["Başlık"]
+    assert "11122233344" not in rows[0]["Başlık"]
+    assert "12345678901" not in rows[0]["Metin"]
+    assert "24681357902" not in rows[0]["Metin"]
+
+
+

@@ -67,6 +67,8 @@ LLM_LIMIT = 0                          # 0 = tüm yeni eşleşmeleri sor; test i
 AGGREGATION_WINDOW_DAYS = 180          # Haber eşleştirme penceresi (son 180 gün)
 ALIAS_MIN_ESLESME = 3                  # Hiçbiri kabul edilmeyen alias için çıkarma önerisi alt sınırı
 ZAYIF_DSCR = 1.2                       # Altındaki DSCR "zayıf finansal" sayılır (kâr düşüşüyle birleşince Stage 2)
+ENABLE_BORSA_ON_FILTRE = True          # Borsa bülteni / en çok kazandıranlar listelerini LLM'den önce eler (risk kelimeleri hariç)
+ENABLE_AJANS_TEKILLESTIRME = True      # Aynı ajans haberinin farklı sitelerdeki kopyalarını LLM'den önce tekilleştirir
 
 # =============================================================================
 # 5. DOSYA YOLLARI (Tümü proje kök dizininde; ağ klasörüyse buradan değiştirilebilir)

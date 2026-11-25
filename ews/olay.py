@@ -188,9 +188,11 @@ def ask_pair(llm, rec: dict) -> dict:
     """Bir (haber, şirket) eşleşmesini sorar; önbelleğe yazılacak sonucu döndürür.
 
     Hata olursa {"hata": ...} döner; bu eşleşme önbelleğe yazılmaz, sonraki çalışmada tekrar sorulur.
-    Tanımsız cevaplar güvenli tarafa çekilir: alaka -> ikincil (olay sorusuna devam), tip -> hicbiri,
-    durum -> iddia, risk olayında risk türü -> kredi.
+    Cevaplar Pydantic v2 şemalarıyla (ews.schemas) doğrulanır; tanımsız cevaplar güvenli tarafa çekilir:
+    alaka -> ikincil (olay sorusuna devam), tip -> hicbiri, durum -> iddia, risk olayında risk türü -> kredi.
     """
+    from ews.schemas import validate_alaka, validate_olay
+
     baslik, metin = str(rec.get("Başlık") or ""), str(rec.get("Metin") or "")
     unvan, alias = rec["Şirket_Adi"], rec["Eşleşen_Alias"]
     ortak = rec.get("Ortak")
@@ -201,8 +203,8 @@ def ask_pair(llm, rec: dict) -> dict:
         unvan=unvan, alias=alias, baslik=baslik, snippet=rec.get("Metin_Snippet") or "", bas=metin[:1000]))
     if obj is None:
         return {"hata": f"alaka: {status}"}
-    result = {"alaka": _pick(obj.get("alaka"), ILGILI + RED, "ikincil"),
-              "alaka_gerekce": str(obj.get("gerekce", ""))[:250]}
+    alaka_model = validate_alaka(obj)
+    result = {"alaka": alaka_model.alaka, "alaka_gerekce": alaka_model.gerekce}
     if result["alaka"] not in ILGILI:
         return result
 
@@ -210,13 +212,13 @@ def ask_pair(llm, rec: dict) -> dict:
         unvan=unvan, alias=alias, baslik=baslik, metin=metin[:6000], tipler=_TIPLER, tip_adlari="|".join(OLAY_TIPLERI)))
     if obj is None:
         return {"hata": f"olay: {status}"}
-    tip = _pick(obj.get("olay_tipi"), OLAY_TIPLERI, "hicbiri")
+    olay_model = validate_olay(obj)
     result.update({
-        "olay_tipi": tip,
-        "durum": _pick(obj.get("durum"), DURUMLAR, "iddia"),
-        "risk_turu": _pick(obj.get("risk_turu"), RISK_TURLERI, "kredi") if tip_seviyesi(tip) else "",
-        "alinti": str(obj.get("alinti", ""))[:300],
-        "ozet": str(obj.get("ozet", ""))[:200],
+        "olay_tipi": olay_model.olay_tipi,
+        "durum": olay_model.durum,
+        "risk_turu": olay_model.risk_turu if tip_seviyesi(olay_model.olay_tipi) else "",
+        "alinti": olay_model.alinti,
+        "ozet": olay_model.ozet,
     })
     return result
 

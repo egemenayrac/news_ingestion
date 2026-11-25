@@ -27,6 +27,12 @@ REQUIRED_PACKAGES = {
     "requests": "requests",
     "urllib3": "urllib3",
     "bs4": "beautifulsoup4",
+    "pydantic": "pydantic",
+    "openai": "openai",
+    "httpx": "httpx",
+    "tenacity": "tenacity",
+    "duckdb": "duckdb",
+    "pypdf": "pypdf",
 }
 
 

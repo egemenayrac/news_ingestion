@@ -15,13 +15,14 @@ olay defteri (ews/defter.py) akışına girer.
 from __future__ import annotations
 
 import getpass
+import io
 import logging
 import os
 import re
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Tuple
 from urllib.parse import quote, urljoin
 
 import pandas as pd
@@ -60,10 +61,12 @@ ILAN_GOV_HEADERS = {
     "x-requested-with": "XMLHttpRequest",
 }
 
-# Resmi ilanlarda aranan risk anahtar kelimeleri
+# Resmi ilanlarda aranan risk anahtar kelimeleri (HTML ve PDF ilanlar için)
 RISK_KEYWORDS_RE = re.compile(
     r"\b(konkordato|geçici\s+mühlet|kesin\s+mühlet|iflas|tasfiye|alacaklılara\s+çağrı|"
-    r"ihale(?:lere)?\s+katılmaktan\s+yasaklama|kayy[ıu]m|mal\s*varlığına\s+tedbir)\b",
+    r"ihale(?:lere|den)?\s+(?:katılmaktan\s+)?yasakla\w*|yasaklama\s+karar[ıi]|"
+    r"kayy[ıu]m|mal\s*varlığına\s+(?:tedbir|el\s+koy\w*)|tmsf|tasarruf\s+mevduatı\s+sigorta\s+fonu|"
+    r"yargı\s+ilan[ıi]|icra\s+ve\s+iflas)\b",
     flags=re.IGNORECASE | re.UNICODE,
 )
 VKN_PATTERNS = (
@@ -240,10 +243,70 @@ def fetch_ilan_gov_tr(session: requests.Session, existing_urls: Set[str], days: 
 
 
 # =============================================================================
-# 4. Resmî Gazete Çeşitli İlanlar ve İhale Yasaklıları
+# 4. Resmî Gazete Çeşitli İlanlar, İhale Yasaklıları, TMSF ve Yargı İlanları (HTML + PDF)
 # =============================================================================
+def extract_pdf_text(pdf_bytes: bytes, max_pages: int = 30) -> str:
+    """Resmî Gazete PDF ilanından metni `pypdf` ile çıkarır ve 11 haneli TCKN'leri anında maskeler.
+
+    10 haneli şirket VKN'leri ve 16 haneli MERSİS numaraları `mask_tckn` tarafından korunur.
+    Bozuk/şifreli PDF'lerde akışı kırmadan boş string döner.
+    """
+    if not pdf_bytes:
+        return ""
+    try:
+        from pypdf import PdfReader
+    except ImportError:
+        logger.warning("pypdf kurulu değil; Resmî Gazete PDF ilanları atlandı (pip install pypdf).")
+        return ""
+    try:
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+        pages_text: List[str] = []
+        for page in reader.pages[:max_pages]:
+            txt = page.extract_text() or ""
+            if txt.strip():
+                pages_text.append(txt)
+        raw = re.sub(r"\s+", " ", "\n".join(pages_text)).strip()
+        return mask_tckn(raw)
+    except Exception as exc:
+        logger.warning("Resmî Gazete PDF okunamadı: %s", exc)
+        return ""
+
+
+def _is_pdf_response(url: str, response: object) -> bool:
+    clean_url = (url or "").split("?", 1)[0].split("#", 1)[0].lower()
+    if clean_url.endswith(".pdf"):
+        return True
+    headers = getattr(response, "headers", None) or {}
+    ctype = str(headers.get("Content-Type") or headers.get("content-type") or "").lower()
+    if "application/pdf" in ctype:
+        return True
+    content = getattr(response, "content", b"") or b""
+    return isinstance(content, (bytes, bytearray)) and content[:5] == b"%PDF-"
+
+
+def _extract_resmi_gazete_links(soup: BeautifulSoup, index_url: str) -> List[Tuple[str, str]]:
+    """Günlük indeks sayfasından HTML ve PDF ilan bağlantılarını `(url, link_metni)` olarak çıkarır."""
+    links: List[Tuple[str, str]] = []
+    seen: Set[str] = set()
+    for a in soup.find_all("a", href=True):
+        href = str(a["href"]).strip()
+        clean_href = href.split("?", 1)[0].split("#", 1)[0].lower()
+        if not clean_href.endswith((".htm", ".html", ".pdf")) or clean_href.endswith("-4.htm"):
+            continue
+        full_url = urljoin(index_url, href)
+        if full_url in seen:
+            continue
+        seen.add(full_url)
+        links.append((full_url, a.get_text(" ", strip=True)))
+    return links
+
+
 def fetch_resmi_gazete(session: requests.Session, existing_urls: Set[str], days: int = LOOKBACK_DAYS) -> List[dict]:
-    """Son `days` günün Resmî Gazete 'Çeşitli İlanlar' sayfasındaki ihale yasaklıları ve yargı ilanlarını tarar."""
+    """Son `days` günün Resmî Gazete 'Çeşitli İlanlar' sayfasındaki HTML ve PDF ilanlarını tarar.
+
+    İhale yasaklama, TMSF ve yargı ilanları (PDF dahil) `pypdf` ile okunur; tüm metin ve başlıklarda
+    11 haneli TCKN maskelenir, 10 haneli VKN ve 16 haneli MERSİS çıkarılır.
+    """
     results: List[dict] = []
     today = datetime.now(timezone.utc)
 
@@ -259,21 +322,27 @@ def fetch_resmi_gazete(session: requests.Session, existing_urls: Set[str], days:
             if res.status_code != 200:
                 continue
             soup = BeautifulSoup(res.content, "html.parser")
-            links = [urljoin(index_url, a["href"]) for a in soup.find_all("a", href=True)
-                     if a["href"].endswith((".htm", ".html")) and not a["href"].endswith("-4.htm")]
-            for link in links:
+            for link, anchor_text in _extract_resmi_gazete_links(soup, index_url):
                 if link in existing_urls:
                     continue
                 try:
-                    sub_res = session.get(link, timeout=15)
+                    sub_res = session.get(link, timeout=20)
                     if sub_res.status_code != 200:
                         continue
-                    sub_soup = BeautifulSoup(sub_res.content, "html.parser")
-                    text = mask_tckn(re.sub(r"\s+", " ", sub_soup.get_text(" ", strip=True)))
-                    if len(text) < 150 or not RISK_KEYWORDS_RE.search(text):
-                        continue
-                    title_el = sub_soup.find(["h1", "h2", "b", "strong"])
-                    title = title_el.get_text(strip=True)[:160] if title_el else "Resmî Gazete İlanı"
+                    if _is_pdf_response(link, sub_res):
+                        text = extract_pdf_text(sub_res.content)
+                        if len(text) < 100 or not RISK_KEYWORDS_RE.search(text):
+                            continue
+                        raw_title = anchor_text or text[:160] or "Resmî Gazete PDF İlanı"
+                        title = mask_tckn(re.sub(r"\s+", " ", raw_title).strip())[:160]
+                    else:
+                        sub_soup = BeautifulSoup(sub_res.content, "html.parser")
+                        text = mask_tckn(re.sub(r"\s+", " ", sub_soup.get_text(" ", strip=True)))
+                        if len(text) < 150 or not RISK_KEYWORDS_RE.search(text):
+                            continue
+                        title_el = sub_soup.find(["h1", "h2", "b", "strong"])
+                        raw_title = title_el.get_text(strip=True) if title_el else (anchor_text or "Resmî Gazete İlanı")
+                        title = mask_tckn(re.sub(r"\s+", " ", raw_title).strip())[:160]
                     id_tag = extract_identifiers(text)
                     existing_urls.add(link)
                     results.append({

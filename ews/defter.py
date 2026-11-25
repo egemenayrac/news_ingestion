@@ -95,6 +95,8 @@ def _link(rec: dict, events: List[Olay], llm, cache, errors: Dict[str, str]) -> 
     Defter boşken sorulmaz. Önbellek anahtarı defterin o anki halini içerir. LLM hata verirse haber yeni
     olay sayılır ve cevap önbelleğe yazılmaz (sonraki koşuda tekrar sorulur).
     """
+    from ews.schemas import validate_defter_bag
+
     if not events:
         return _YENI
     shown = "\n".join(e.satir() for e in events)
@@ -107,8 +109,8 @@ def _link(rec: dict, events: List[Olay], llm, cache, errors: Dict[str, str]) -> 
         if obj is None:
             errors[key] = f"defter: {status}"
             return _YENI
-        cache.put(key, {"islem": str(obj.get("islem", "")).strip().lower(),
-                        "olay": str(obj.get("olay") or "").strip(" []"), "gerekce": str(obj.get("gerekce", ""))[:200]})
+        bag = validate_defter_bag(obj)
+        cache.put(key, bag.model_dump())
     return cache.get(key)
 
 

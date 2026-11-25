@@ -227,27 +227,27 @@ def build_themes(df: pd.DataFrame, companies: pd.DataFrame, fin: pd.DataFrame, l
         for i, r in items.iterrows()
     )
     key = f"TEMA|{TEMA_SURUMU}|{hashlib.md5(lines.encode('utf-8')).hexdigest()[:12]}"
+    from ews.schemas import validate_temalar
+
     if key not in cache:
         obj, status = llm.ask(SYSTEM_TEMA, TEMA_PROMPT.format(maddeler=lines), max_tokens=4000)
         if obj is None:
             logger.warning("Tema sorusu hata verdi, Temalar sayfası boş: %s", status)
             return pd.DataFrame(columns=TEMA_COLUMNS)
-        cache.put(key, obj)
+        cache.put(key, validate_temalar(obj).model_dump())
 
     bakiye = fin.set_index("Şirket")["Toplam_Bakiye_TRY"] if "Toplam_Bakiye_TRY" in fin else pd.Series(dtype=float)
     sinyal = companies.set_index("Şirket")["LLM_Sinyali"].map(STAGE_NO)
     used, rows = set(), []
-    for t in (cache.get(key) or {}).get("temalar") or []:
-        tema_adi = str(t.get("tema") or "").strip()
-        aciklama = str(t.get("aciklama") or "").strip()
-        kanit_list = t.get("kanit_kelimeler") or t.get("ortak_ifade") or tema_adi
-        if isinstance(kanit_list, str):
-            kanit_list = [x.strip() for x in re.split(r"[,;|]+", kanit_list) if x.strip()]
-        ortak_ifade_str = ", ".join(str(x) for x in kanit_list) if isinstance(kanit_list, list) else str(kanit_list)
-        stems = _extract_stems(kanit_list if isinstance(kanit_list, list) else [kanit_list])
+    validated_themes = validate_temalar(cache.get(key) or {})
+    for t in validated_themes.temalar:
+        tema_adi = t.tema
+        aciklama = t.aciklama
+        kanit_list = t.kanit_kelimeler or ([tema_adi] if tema_adi else [])
+        ortak_ifade_str = ", ".join(kanit_list)
+        stems = _extract_stems(kanit_list)
 
-        raw_nos = [int(i) for i in (t.get("maddeler") or [])
-                   if str(i).strip().isdigit() and int(i) < len(items) and int(i) not in used]
+        raw_nos = [i for i in t.maddeler if 0 <= i < len(items) and i not in used]
         verified_nos = []
         cat_desc = f"{tema_adi}: {aciklama} ({ortak_ifade_str})"
         for i in raw_nos:

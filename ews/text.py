@@ -16,9 +16,10 @@ tutarsızlığı önler.
 
 from __future__ import annotations
 
+import re
 import unicodedata
 from functools import lru_cache
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 
 # =============================================================================
@@ -31,6 +32,17 @@ _TURKISH_FOLD = str.maketrans({
     "ç": "c", "Ç": "c", "ö": "o", "Ö": "o", "ü": "u", "Ü": "u",
 })
 
+# Hızlı 1-e-1 katlama tablosu: ASCII + Türkçe + sık kullanılan tipografik işaretler (uzunluk değişmez).
+_FAST_EXTRA_CHARS = "çğıöşüÇĞİÖŞÜâîûÂÎÛ‘’“”–—•₺€£"
+_FAST_TRANS = str.maketrans({
+    **{chr(i): chr(i).lower() for i in range(128)},
+    "ı": "i", "İ": "i", "I": "i",
+    "ş": "s", "Ş": "s", "ğ": "g", "Ğ": "g",
+    "ç": "c", "Ç": "c", "ö": "o", "Ö": "o", "ü": "u", "Ü": "u",
+    "â": "a", "Â": "a", "î": "i", "Î": "i", "û": "u", "Û": "u",
+})
+_NON_FAST_RE = re.compile(r"[^\x00-\x7fçğıöşüÇĞİÖŞÜâîûÂÎÛ‘’“”–—•₺€£]")
+
 
 @lru_cache(maxsize=8192)
 def _normalize_char(ch: str) -> str:
@@ -38,6 +50,18 @@ def _normalize_char(ch: str) -> str:
     value = unicodedata.normalize("NFKC", ch)
     value = value.translate(_TURKISH_FOLD).casefold()
     return "".join(c for c in unicodedata.normalize("NFKD", value) if not unicodedata.combining(c))
+
+
+def fast_normalize_if_1to1(text: object) -> Optional[str]:
+    """Metin yalnızca 1-e-1 güvenli karakterlerden oluşuyorsa C hızında normalize metin döner; aksi halde None."""
+    if text is None:
+        return ""
+    value = str(text)
+    if not value:
+        return ""
+    if _NON_FAST_RE.search(value) is None:
+        return value.translate(_FAST_TRANS)
+    return None
 
 
 def normalize_with_offsets(text: object) -> Tuple[str, List[int], List[int]]:
@@ -52,6 +76,11 @@ def normalize_with_offsets(text: object) -> Tuple[str, List[int], List[int]]:
         return "", [], []
 
     value = str(text)
+    fast = fast_normalize_if_1to1(value)
+    if fast is not None:
+        n = len(fast)
+        return fast, list(range(n)), list(range(1, n + 1))
+
     out: List[str] = []
     starts: List[int] = []
     ends: List[int] = []
@@ -72,6 +101,9 @@ def normalize_with_offsets(text: object) -> Tuple[str, List[int], List[int]]:
 
 def normalize_text(text: object) -> str:
     """Gevşek normalize edilmiş metni döndürür ("Gümüşhane" -> "gumushane")."""
+    fast = fast_normalize_if_1to1(text)
+    if fast is not None:
+        return fast
     return normalize_with_offsets(text)[0]
 
 
